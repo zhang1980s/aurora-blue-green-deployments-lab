@@ -1,0 +1,21 @@
+# ConfigMap for workload simulator configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workload-simulator-config
+  namespace: default
+data:
+  # Number of write workers per pod
+  write-workers: "10"
+
+  # Write rate per worker (writes/second)
+  write-rate: "100"
+
+  # Connection pool size
+  connection-pool-size: "100"
+
+  # Statistics log interval in seconds
+  log-interval: "10"
+
+  # Enable Prometheus metrics export
+  enable-prometheus: "true"
