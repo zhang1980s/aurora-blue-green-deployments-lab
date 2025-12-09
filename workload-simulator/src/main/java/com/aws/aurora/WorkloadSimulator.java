@@ -19,7 +19,9 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -54,6 +56,8 @@ public class WorkloadSimulator {
     private final String password;
     private final int writeWorkers;
     private final int writeRatePerWorker;
+    private final int readWorkers;
+    private final int readRatePerWorker;
     private final int connectionPoolSize;
     private final int logIntervalSeconds;
     private final String blueGreenDeploymentId;
@@ -67,10 +71,19 @@ public class WorkloadSimulator {
     private final Counter failureCounter;
     private final Timer writeLatencyTimer;
 
-    // Atomic counters for statistics
+    // Atomic counters for write statistics
     private final AtomicLong totalRequests = new AtomicLong(0);
     private final AtomicLong successfulRequests = new AtomicLong(0);
     private final AtomicLong failedRequests = new AtomicLong(0);
+
+    // Atomic counters for read statistics
+    private final AtomicLong totalReadRequests = new AtomicLong(0);
+    private final AtomicLong successfulReadRequests = new AtomicLong(0);
+    private final AtomicLong failedReadRequests = new AtomicLong(0);
+    private final AtomicLong totalReadLatencyMs = new AtomicLong(0);
+
+    // Host distribution tracking for reads
+    private final ConcurrentHashMap<String, AtomicLong> readHostDistribution = new ConcurrentHashMap<>();
 
     // Executor services
     private ExecutorService workerExecutor;
@@ -90,6 +103,8 @@ public class WorkloadSimulator {
         this.password = config.password;
         this.writeWorkers = config.writeWorkers;
         this.writeRatePerWorker = config.writeRatePerWorker;
+        this.readWorkers = config.readWorkers;
+        this.readRatePerWorker = config.readRatePerWorker;
         this.connectionPoolSize = config.connectionPoolSize;
         this.logIntervalSeconds = config.logIntervalSeconds;
         this.blueGreenDeploymentId = config.blueGreenDeploymentId;
@@ -185,7 +200,8 @@ public class WorkloadSimulator {
         }
 
         // Create executor services
-        workerExecutor = Executors.newFixedThreadPool(writeWorkers);
+        int totalWorkers = writeWorkers + readWorkers;
+        workerExecutor = Executors.newFixedThreadPool(totalWorkers);
         statsExecutor = Executors.newScheduledThreadPool(1);
 
         // Start statistics logging
@@ -202,7 +218,14 @@ public class WorkloadSimulator {
             workerExecutor.submit(() -> writeWorker(workerId));
         }
 
-        logger.info("Workload simulator started successfully");
+        // Start read workers
+        for (int i = 0; i < readWorkers; i++) {
+            final int workerId = i + 1;
+            workerExecutor.submit(() -> readWorker(workerId));
+        }
+
+        logger.info("Workload simulator started successfully (Write workers: {}, Read workers: {})",
+            writeWorkers, readWorkers);
 
         // Add shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
@@ -301,6 +324,74 @@ public class WorkloadSimulator {
     }
 
     /**
+     * Read worker thread
+     */
+    private void readWorker(int workerId) {
+        logger.info("Reader-{} started", workerId);
+
+        long delayMs = readRatePerWorker > 0 ? 1000 / readRatePerWorker : 0;
+        String currentHost = null;
+
+        while (running.get()) {
+            long startTime = System.currentTimeMillis();
+
+            try {
+                // Execute read operation
+                String result = executeRead(workerId);
+                long latency = System.currentTimeMillis() - startTime;
+
+                if (result != null) {
+                    successfulReadRequests.incrementAndGet();
+                    totalReadLatencyMs.addAndGet(latency);
+
+                    // Extract hostname from result (format: "hostname (server_id=X, version=Y, read_only=Z)")
+                    String hostname = result.split(" \\(")[0];
+
+                    // Track host distribution
+                    readHostDistribution.computeIfAbsent(hostname, k -> new AtomicLong(0)).incrementAndGet();
+
+                    // Check for host switch
+                    if (!hostname.equals(currentHost)) {
+                        if (currentHost != null) {
+                            logger.info("Reader-{} | Switched to new host: {} (from: {})",
+                                workerId, result, currentHost);
+                        }
+                        currentHost = hostname;
+                    }
+
+                    logger.info("SUCCESS: Reader-{} | Result: {} | Latency: {}ms",
+                        workerId, result, latency);
+                } else {
+                    failedReadRequests.incrementAndGet();
+                    logger.error("FAILED: Reader-{} | Query: system_vars | READ failed | Latency: {}ms",
+                        workerId, latency);
+                }
+
+                totalReadRequests.incrementAndGet();
+
+                // Rate limiting
+                if (delayMs > 0) {
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    long sleepTime = delayMs - elapsed;
+                    if (sleepTime > 0) {
+                        Thread.sleep(sleepTime);
+                    }
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("Reader-{} encountered unexpected error", workerId, e);
+                failedReadRequests.incrementAndGet();
+                totalReadRequests.incrementAndGet();
+            }
+        }
+
+        logger.info("Reader-{} stopped", workerId);
+    }
+
+    /**
      * Execute a write operation with retry logic
      */
     private boolean executeWrite(String tableName, int workerId) {
@@ -343,6 +434,56 @@ public class WorkloadSimulator {
     }
 
     /**
+     * Execute a read operation with retry logic
+     */
+    private String executeRead(int workerId) {
+        int maxRetries = 5;
+        int retryDelayMs = 500;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT @@hostname, @@server_id, @@aurora_version, @@read_only")) {
+
+                ResultSet rs = stmt.executeQuery();
+                if (rs.next()) {
+                    String hostname = rs.getString(1);
+                    int serverId = rs.getInt(2);
+                    String auroraVersion = rs.getString(3);
+                    int readOnly = rs.getInt(4);
+
+                    // Format detailed result string
+                    String result = String.format("%s (server_id=%d, version=%s, read_only=%d)",
+                        hostname, serverId, auroraVersion, readOnly);
+
+                    return result;
+                }
+
+                return null;
+
+            } catch (SQLException e) {
+                if (attempt < maxRetries) {
+                    logger.warn("Reader-{} | Query: system_vars | connection_error | Retry {}/{} in {}ms | Error: {}",
+                        workerId, attempt, maxRetries, retryDelayMs, e.getMessage());
+
+                    try {
+                        Thread.sleep(retryDelayMs);
+                        retryDelayMs *= 2; // Exponential backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return null;
+                    }
+                } else {
+                    logger.error("Reader-{} | Query: system_vars | Max retries exceeded", workerId);
+                    return null;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Get current Aurora host
      */
     private String getCurrentHost() {
@@ -363,14 +504,45 @@ public class WorkloadSimulator {
      * Log statistics
      */
     private void logStatistics() {
+        // Write statistics
         long total = totalRequests.get();
         long success = successfulRequests.get();
         long failed = failedRequests.get();
         double successRate = total > 0 ? (success * 100.0 / total) : 0.0;
 
+        // Read statistics
+        long totalRead = totalReadRequests.get();
+        long successRead = successfulReadRequests.get();
+        long failedRead = failedReadRequests.get();
+        double readSuccessRate = totalRead > 0 ? (successRead * 100.0 / totalRead) : 0.0;
+        double avgReadLatency = successRead > 0 ? (totalReadLatencyMs.get() * 1.0 / successRead) : 0.0;
+
         logger.info("========================================");
-        logger.info("STATS: Total: {} | Success: {} | Failed: {} | Success Rate: {}%",
-            total, success, failed, String.format("%.2f", successRate));
+
+        // Log write stats if write workers are enabled
+        if (writeWorkers > 0) {
+            logger.info("WRITE STATS: Total: {} | Success: {} | Failed: {} | Success Rate: {}%",
+                total, success, failed, String.format("%.2f", successRate));
+        }
+
+        // Log read stats if read workers are enabled
+        if (readWorkers > 0) {
+            logger.info("READ STATS: Total: {} | Success: {} | Failed: {} | Success Rate: {}% | Avg Latency: {}ms",
+                totalRead, successRead, failedRead, String.format("%.2f", readSuccessRate),
+                String.format("%.1f", avgReadLatency));
+
+            // Log host distribution
+            if (!readHostDistribution.isEmpty()) {
+                logger.info("READ HOST DISTRIBUTION:");
+                for (Map.Entry<String, AtomicLong> entry : readHostDistribution.entrySet()) {
+                    long count = entry.getValue().get();
+                    double percentage = totalRead > 0 ? (count * 100.0 / totalRead) : 0.0;
+                    logger.info("  {} : {} queries ({}%)",
+                        entry.getKey(), count, String.format("%.2f", percentage));
+                }
+            }
+        }
+
         logger.info("========================================");
     }
 
@@ -417,6 +589,8 @@ public class WorkloadSimulator {
         String password;
         int writeWorkers = 10;
         int writeRatePerWorker = 100;
+        int readWorkers = 0;
+        int readRatePerWorker = 100;
         int connectionPoolSize = 100;
         int logIntervalSeconds = 10;
         String blueGreenDeploymentId = null;
@@ -449,6 +623,12 @@ public class WorkloadSimulator {
                     break;
                 case "--write-rate":
                     config.writeRatePerWorker = Integer.parseInt(args[++i]);
+                    break;
+                case "--read-workers":
+                    config.readWorkers = Integer.parseInt(args[++i]);
+                    break;
+                case "--read-rate":
+                    config.readRatePerWorker = Integer.parseInt(args[++i]);
                     break;
                 case "--connection-pool-size":
                     config.connectionPoolSize = Integer.parseInt(args[++i]);
@@ -528,6 +708,8 @@ public class WorkloadSimulator {
         System.out.println("  --password <password>           Database password (or use DB_PASSWORD env var)");
         System.out.println("  --write-workers <count>         Number of write workers (default: 10, minimum: 1)");
         System.out.println("  --write-rate <rate>             Writes per second per worker (default: 100)");
+        System.out.println("  --read-workers <count>          Number of read workers (default: 0)");
+        System.out.println("  --read-rate <rate>              Reads per second per worker (default: 100)");
         System.out.println("  --connection-pool-size <size>   Connection pool size (default: 100)");
         System.out.println("  --log-interval <seconds>        Statistics log interval (default: 10)");
         System.out.println("  --blue-green-deployment-id <id> Blue-Green deployment ID (optional, auto-detect if not provided)");
@@ -544,6 +726,14 @@ public class WorkloadSimulator {
         System.out.println("    --write-workers 50 \\");
         System.out.println("    --write-rate 200 \\");
         System.out.println("    --connection-pool-size 500 \\");
+        System.out.println("    --password MySecretPassword");
+        System.out.println("\n  # Mixed workload (write + read)");
+        System.out.println("  java -jar workload-simulator.jar \\");
+        System.out.println("    --aurora-endpoint my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com \\");
+        System.out.println("    --write-workers 10 \\");
+        System.out.println("    --write-rate 50 \\");
+        System.out.println("    --read-workers 10 \\");
+        System.out.println("    --read-rate 50 \\");
         System.out.println("    --password MySecretPassword");
     }
 }

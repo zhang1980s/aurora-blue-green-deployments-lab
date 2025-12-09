@@ -1,13 +1,14 @@
 # Aurora Blue-Green Workload Simulator
 
-A Java-based workload simulator designed to test Aurora Blue-Green deployment scenarios with realistic write workloads.
+A Java-based workload simulator designed to test Aurora Blue-Green deployment scenarios with realistic write and read workloads.
 
 ## Features
 
-- **Write-Heavy Workload**: Simulates production-like write operations against Aurora MySQL
+- **Mixed Workload Support**: Simulates both write and read operations against Aurora MySQL writer instance
 - **AWS JDBC Wrapper Integration**: Uses AWS Advanced JDBC Wrapper with Blue-Green plugin support
 - **Automatic Failover Handling**: Built-in connection retry logic with exponential backoff
-- **Real-Time Monitoring**: Console output with success/failure indicators and statistics
+- **Real-Time Monitoring**: Console output with success/failure indicators and detailed statistics
+- **Host Distribution Tracking**: Monitors which Aurora nodes handle read queries during Blue-Green switchover
 - **Prometheus Metrics**: Optional metrics export for advanced monitoring (EKS deployments)
 - **Flexible Deployment**: Can run on EC2 or Kubernetes (EKS)
 
@@ -182,6 +183,29 @@ java -jar target/workload-simulator.jar \
   --connection-pool-size 500
 ```
 
+**Mixed Workload (Write + Read):**
+```bash
+java -jar target/workload-simulator.jar \
+  --aurora-endpoint my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com \
+  --password MySecretPassword \
+  --write-workers 10 \
+  --write-rate 50 \
+  --read-workers 10 \
+  --read-rate 50 \
+  --connection-pool-size 200
+```
+
+**Read-Only Workload:**
+```bash
+java -jar target/workload-simulator.jar \
+  --aurora-endpoint my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com \
+  --password MySecretPassword \
+  --write-workers 0 \
+  --read-workers 20 \
+  --read-rate 100 \
+  --connection-pool-size 200
+```
+
 **Using Environment Variable for Password:**
 ```bash
 export DB_PASSWORD="MySecretPassword"
@@ -229,30 +253,101 @@ kubectl scale deployment workload-simulator --replicas=5
 | `--password` | Database password | `DB_PASSWORD` env var | Yes |
 | `--write-workers` | Number of concurrent write workers | `10` | No |
 | `--write-rate` | Writes per second per worker | `100` | No |
+| `--read-workers` | Number of concurrent read workers | `0` | No |
+| `--read-rate` | Reads per second per worker | `100` | No |
 | `--connection-pool-size` | HikariCP connection pool size | `100` | No |
 | `--log-interval` | Statistics log interval (seconds) | `10` | No |
 | `--blue-green-deployment-id` | Blue-Green deployment ID | auto-detect | No |
 | `--enable-prometheus` | Enable Prometheus metrics | `false` | No |
 
+### Read Workload Details
+
+The read workload feature allows you to simulate read operations alongside write operations to better understand how Aurora Blue-Green deployments affect different types of database traffic.
+
+**Key Characteristics:**
+- Read operations execute `SELECT @@hostname, @@server_id, @@aurora_version, @@read_only` to query system variables
+- All read operations target the **writer instance** (same endpoint as write operations)
+- Tracks which Aurora node handles each read query, including server ID, Aurora version, and read-only status
+- Monitors host distribution before, during, and after Blue-Green switchover
+- Useful for observing connection behavior, DNS propagation, and version changes during switchover
+
+**Use Cases:**
+1. **Mixed Workload Testing**: Simulate realistic production scenarios with both reads and writes
+2. **Host Distribution Analysis**: Track which database node handles queries during switchover
+3. **Connection Behavior**: Observe how read connections behave differently than write connections during failover
+4. **DNS Propagation**: Monitor endpoint resolution changes during Blue-Green switchover
+
+**Important Notes:**
+- Set `--write-workers 0` to run read-only workload
+- Read workers use the same connection pool as write workers
+- Host distribution statistics show which Aurora node processed each query
+- Latency metrics help identify performance impact during switchover
+
 ## Understanding the Output
 
-### Console Log Format
+### Console Log Format - Write Operations
 
 ```
-[timestamp] INFO: Workload Simulator Started
+[timestamp] INFO: Workload Simulator Started (Write workers: 10, Read workers: 0)
 [timestamp] INFO: Aurora Endpoint: my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com
-[timestamp] INFO: Workers: 10, Rate: 100 writes/sec/worker
 [timestamp] SUCCESS: Worker-1 | Host: ip-10-0-1-45 (writer) | Table: test_0001 | INSERT completed | Latency: 12ms
 [timestamp] SUCCESS: Worker-2 | Host: ip-10-0-1-45 (writer) | Table: test_0042 | INSERT completed | Latency: 15ms
-[timestamp] STATS: Total: 1000 | Success: 1000 | Failed: 0 | Success Rate: 100.00%
+```
+
+### Console Log Format - Read Operations
+
+```
+[timestamp] SUCCESS: Reader-1 | Result: ip-10-0-1-45.ap-southeast-1.compute.internal (server_id=123, version=3.04.1, read_only=0) | Latency: 8ms
+[timestamp] SUCCESS: Reader-2 | Result: ip-10-0-1-45.ap-southeast-1.compute.internal (server_id=123, version=3.04.1, read_only=0) | Latency: 7ms
+```
+
+**What the output shows:**
+- **hostname**: The Aurora instance hostname (e.g., `ip-10-0-1-45.ap-southeast-1.compute.internal`)
+- **server_id**: MySQL server ID (unique per instance)
+- **version**: Aurora MySQL version (e.g., `3.04.1` for blue, `3.10.2` for green)
+- **read_only**: 0=writer instance, 1=reader instance (should always be 0 for writer endpoint)
+- **Latency**: Query execution time in milliseconds
+
+### Statistics Output (Mixed Workload)
+
+```
+========================================
+WRITE STATS: Total: 5000 | Success: 5000 | Failed: 0 | Success Rate: 100.00%
+READ STATS: Total: 5000 | Success: 4998 | Failed: 2 | Success Rate: 99.96% | Avg Latency: 8.3ms
+READ HOST DISTRIBUTION:
+  ip-10-0-1-45.ap-southeast-1.compute.internal : 4998 queries (99.96%)
+========================================
 ```
 
 ### During Blue-Green Switchover
 
+**Write Worker:**
 ```
 [timestamp] ERROR: Worker-5 | Table: test_0123 | connection_lost | Retry 1/5 in 500ms | Error: Communications link failure
 [timestamp] INFO: Worker-5 | Switched to new host: ip-10-0-2-78 (writer) (from: ip-10-0-1-45 (writer))
 [timestamp] SUCCESS: Worker-5 | Host: ip-10-0-2-78 (writer) | Table: test_0123 | INSERT completed | Latency: 234ms (retry 1)
+```
+
+**Read Worker:**
+```
+[timestamp] WARN: Reader-3 | Query: system_vars | connection_error | Retry 1/5 in 500ms | Error: Communications link failure
+[timestamp] INFO: Reader-3 | Switched to new host: ip-10-0-2-78.ap-southeast-1.compute.internal (server_id=456, version=3.10.2, read_only=0) (from: ip-10-0-1-45.ap-southeast-1.compute.internal)
+[timestamp] SUCCESS: Reader-3 | Result: ip-10-0-2-78.ap-southeast-1.compute.internal (server_id=456, version=3.10.2, read_only=0) | Latency: 187ms
+```
+
+**Key observations during switchover:**
+- Version changes from `3.04.1` (blue) to `3.10.2` (green)
+- Server ID changes indicating connection to a different Aurora instance
+- Hostname changes from old instance to new instance
+- `read_only=0` remains constant (both are writer instances)
+
+**Host Distribution After Switchover:**
+```
+========================================
+READ HOST DISTRIBUTION:
+  ip-10-0-1-45.ap-southeast-1.compute.internal : 2500 queries (50.0%)
+  ip-10-0-2-78.ap-southeast-1.compute.internal : 2500 queries (50.0%)
+========================================
 ```
 
 ## JDBC Connection URL Format
@@ -282,13 +377,14 @@ jdbc:aws-wrapper:mysql://endpoint:3306/database?wrapperPlugins=initialConnection
 
 **Recommended Formula:**
 ```
-Connection Pool Size = Write Workers × 10
+Connection Pool Size = (Write Workers + Read Workers) × 10
 ```
 
 **Examples:**
-- 10 workers → 100 connections
-- 50 workers → 500 connections
-- 100 workers → 1000 connections
+- 10 write workers → 100 connections
+- 50 write workers → 500 connections
+- 10 write + 10 read workers → 200 connections
+- 20 write + 20 read workers → 400 connections
 
 ### JVM Options (Containerized Deployments)
 
@@ -415,7 +511,7 @@ workload-simulator/
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| AWS Advanced JDBC Wrapper | 2.6.7 | Blue-Green plugin support |
+| AWS Advanced JDBC Wrapper | 2.6.8 | Blue-Green plugin support |
 | MySQL Connector/J | 8.0.33 | MySQL JDBC driver |
 | HikariCP | 5.0.1 | Connection pooling |
 | SLF4J | 2.0.9 | Logging API |
