@@ -76,7 +76,7 @@ SELECT * FROM mysql.rds_topology LIMIT 1;
 
 **Expected Result**: Query returns successfully (even if empty)
 
-**Important**: These permissions must be granted on both Blue and Green clusters and should NOT be revoked after switchover.
+**Important**: These permissions must be granted on both Blue and Green clusters and should NOT be revoked or modified before switchover.
 
 **If Access Denied - Grant Permissions:**
 ```sql
