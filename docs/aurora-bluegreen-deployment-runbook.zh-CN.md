@@ -187,6 +187,27 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 - 事务成功/失败率
 - P50、P95、P99 延迟
 
+#### ☐ 7. 通用最佳实践验证
+
+在继续 Blue-Green 部署之前，验证以下最佳实践:
+
+**连接策略:**
+- ☐ 对所有连接使用集群端点、读取器端点或自定义端点
+- ☐ 不要使用实例端点
+- ☐ 不要使用带有静态或排除列表的自定义端点
+- ☐ 确保无缝切换，无需更改连接字符串
+
+**Green 环境使用:**
+- ☐ 在切换之前保持 green 环境为只读
+- ☐ 谨慎启用写入操作（可能导致复制冲突）
+- ☐ 避免切换后可能成为生产数据的非预期数据
+
+**模式更改兼容性:**
+- ☐ 仅进行复制兼容的模式更改
+- ☐ **兼容**: 在表末尾添加新列
+- ☐ **不兼容**: 重命名列或表（破坏复制）
+- ☐ 参考: [MySQL 不同表定义的复制](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
+
 ---
 
 ## 部署准备
@@ -293,6 +314,43 @@ aws cloudwatch get-metric-statistics \
 - ☐ 复制延迟 < 1 秒
 - ☐ Green 集群端点可访问
 - ☐ 应用程序日志显示: `[bgdId: '1'] BG status: CREATED`
+
+#### 操作 3.4: 管理复制延迟（如适用）
+
+**Aurora MySQL 最佳实践**: 如果 green 环境出现复制延迟，请考虑以下方法:
+
+**选项 1: 临时禁用二进制日志保留**
+```bash
+# 如果不需要二进制日志保留，请临时禁用它
+# 在数据库集群参数组中将 binlog_format 设置回 0
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name <green-param-group-name> \
+  --parameters "ParameterName=binlog_format,ParameterValue=OFF,ApplyMethod=immediate"
+
+# 重启 green 写入器数据库实例
+aws rds reboot-db-instance --db-instance-identifier <green-writer-instance-id>
+
+# 复制赶上后重新启用
+```
+
+**选项 2: 临时调整 innodb_flush_log_at_trx_commit**
+```bash
+# 在 green 数据库参数组中将 innodb_flush_log_at_trx_commit 设置为 0
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name <green-param-group-name> \
+  --parameters "ParameterName=innodb_flush_log_at_trx_commit,ParameterValue=0,ApplyMethod=immediate"
+
+# 重要: 在切换前恢复为默认值 1
+# 警告: 如果使用此设置时发生意外关闭，请重建 green 环境
+```
+
+**参考**: [配置日志缓冲区刷新频率](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.BestPractices.FeatureRecommendations.html#AuroraMySQL.BestPractices.Flush)
+
+**监控复制延迟:**
+- 每 1-2 分钟监控 `AuroraBinlogReplicaLag` CloudWatch 指标
+- 确保 Green 集群的规模不低于工作负载要求
+- 检查 Blue 和 Green 上的资源利用率（CPU、内存、IOPS）
+- 目标: 在继续切换之前复制延迟 < 1 秒
 
 ---
 
@@ -723,4 +781,5 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 **如有问题或疑问，请参考:**
 - [AWS Advanced JDBC Wrapper Documentation](https://github.com/aws/aws-advanced-jdbc-wrapper)
 - [Aurora Blue-Green Deployments Guide](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/blue-green-deployments.html)
+- [Blue-Green 部署最佳实践](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/blue-green-deployments-best-practices.html)
 - [Architecture Deep Dive](./aws-jdbc-wrapper-bluegreen-architecture.md)

@@ -187,6 +187,27 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 - Transaction success/failure rate
 - P50, P95, P99 latency
 
+#### ☐ 7. General Best Practices Verification
+
+Before proceeding with Blue-Green deployment, verify the following best practices:
+
+**Connection Strategy:**
+- ☐ Use cluster endpoint, reader endpoint, or custom endpoint for all connections
+- ☐ Do NOT use instance endpoints
+- ☐ Do NOT use custom endpoints with static or exclusion lists
+- ☐ Ensures seamless switchover without connection string changes
+
+**Green Environment Usage:**
+- ☐ Keep green environment read-only until switchover
+- ☐ Enable write operations with caution (can cause replication conflicts)
+- ☐ Avoid unintended data that could become production data after switchover
+
+**Schema Change Compatibility:**
+- ☐ Make only replication-compatible schema changes
+- ☐ **Compatible**: Adding new columns at the end of a table
+- ☐ **Incompatible**: Renaming columns or tables (breaks replication)
+- ☐ Reference: [MySQL Replication with Differing Table Definitions](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
+
 ---
 
 ## Deployment Preparation
@@ -293,6 +314,43 @@ aws cloudwatch get-metric-statistics \
 - ☐ Replication lag < 1 second
 - ☐ Green cluster endpoint accessible
 - ☐ Application logs show: `[bgdId: '1'] BG status: CREATED`
+
+#### Action 3.4: Manage Replica Lag (If Applicable)
+
+**Aurora MySQL Best Practice**: If the green environment experiences replica lag, consider the following:
+
+**Option 1: Temporarily Disable Binary Log Retention**
+```bash
+# If binary log retention is not needed, temporarily disable it
+# Set binlog_format back to 0 in DB cluster parameter group
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name <green-param-group-name> \
+  --parameters "ParameterName=binlog_format,ParameterValue=OFF,ApplyMethod=immediate"
+
+# Reboot the green writer DB instance
+aws rds reboot-db-instance --db-instance-identifier <green-writer-instance-id>
+
+# Re-enable after replication catches up
+```
+
+**Option 2: Temporarily Adjust innodb_flush_log_at_trx_commit**
+```bash
+# Set innodb_flush_log_at_trx_commit to 0 in green DB parameter group
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name <green-param-group-name> \
+  --parameters "ParameterName=innodb_flush_log_at_trx_commit,ParameterValue=0,ApplyMethod=immediate"
+
+# IMPORTANT: Revert to default value of 1 before switchover
+# WARNING: If unexpected shutdown occurs with this setting, rebuild green environment
+```
+
+**Reference**: [Configuring how frequently the log buffer is flushed](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.BestPractices.FeatureRecommendations.html#AuroraMySQL.BestPractices.Flush)
+
+**Monitoring Replica Lag:**
+- Monitor `AuroraBinlogReplicaLag` CloudWatch metric every 1-2 minutes
+- Ensure Green cluster is not undersized for the workload
+- Check resource utilization (CPU, memory, IOPS) on both Blue and Green
+- Target: Replication lag < 1 second before proceeding to switchover
 
 ---
 
@@ -723,4 +781,5 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 **For questions or issues, refer to:**
 - [AWS Advanced JDBC Wrapper Documentation](https://github.com/aws/aws-advanced-jdbc-wrapper)
 - [Aurora Blue-Green Deployments Guide](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/blue-green-deployments.html)
+- [Best Practices for Blue-Green Deployments](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/blue-green-deployments-best-practices.html)
 - [Architecture Deep Dive](./aws-jdbc-wrapper-bluegreen-architecture.md)
