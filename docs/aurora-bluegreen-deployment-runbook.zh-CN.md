@@ -29,22 +29,10 @@
 本运维手册提供使用 AWS Advanced JDBC Wrapper 执行 Aurora MySQL Blue-Green 部署的分步说明，实现最小停机时间。
 
 ### 预期结果
-- **停机时间**: 几秒钟，取决于读工作负载
+- **停机时间**: 几秒钟，取决于真实工作负载
 - **成功率**: 100%（自动重试）
 - **失败事务**: 0 个永久失败
-- **Worker 影响**: 部分 worker 经历瞬态错误（自动恢复）。在切换期间，部分 worker 线程可能会因集群转换而经历短暂的连接错误。这些错误由 JDBC wrapper 的故障转移插件重试机制自动处理，无需手动干预。
-
-  **应用程序错误感知**: 这表明 JDBC wrapper 的重试机制透明工作，尽管应用程序层可能会在成功重试之前观察到瞬态错误。
-
-  确切行为取决于:
-  - **应用程序的异常处理**: 是否捕获 SQLException?
-  - **连接池配置**: 超时设置（HikariCP 默认值: connectionTimeout=30s, idleTimeout=10min, maxLifetime=30min）
-  - **JDBC wrapper 重试设置**: 默认为 5 次重试，500ms 退避
-
-  **生产部署建议**:
-  - ✅ 记录但不因瞬态数据库错误而失败
-  - ✅ 信任 JDBC wrapper 的自动重试机制
-  - ✅ 监控切换期间的延迟峰值（预期: 第一次操作 2+ 秒）
+- **Worker 影响**: 部分 worker 在切换期间经历瞬态错误，由 JDBC wrapper 重试机制自动恢复（5 次尝试，500ms 退避）。使用 try-catch 代码块的应用程序会观察到 SQLException，但应记录并继续，不应失败。详细的错误处理指南请参见[附录 D](#附录-d-应用程序错误处理与-try-catch-代码块)。
 
 ---
 
@@ -903,6 +891,270 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
    # 验证所有 worker 已恢复
    grep "Retry 1/5" /path/to/application.log | wc -l
    ```
+
+---
+
+## 附录 D: 应用程序错误处理与 Try-Catch 代码块
+
+### 概述
+
+当应用程序在数据库操作周围有 try-catch 代码块时,它们**将会观察到** Blue-Green 切换期间的瞬态 SQLException 错误。然而,JDBC wrapper 的自动重试机制仍然透明工作,确保 100% 成功率。
+
+### 切换期间发生的情况
+
+```java
+try {
+    statement.execute(sql);
+    // 成功路径
+} catch (SQLException e) {
+    // 应用程序将在切换期间捕获此错误
+    logger.error("数据库操作失败", e);
+    // 错误消息: "The active SQL connection has changed"
+}
+```
+
+**预期行为:**
+- **55% 的 worker** 将捕获 SQLException(实验室测试中 20 个 worker 中有 11 个)
+- **45% 的 worker** 不会经历错误(立即成功)
+- **100% 成功率**(重试后)(无永久失败)
+
+### 错误和恢复时间线
+
+```
+T+0ms:   切换开始(IN_PROGRESS 阶段)
+T+27ms:  Worker 遇到连接错误
+         → SQLException 抛给应用程序
+         → 应用程序 catch 块执行
+         → 应用程序记录错误
+T+527ms: JDBC wrapper 自动重试(500ms 退避)
+         → 重试在 Green 集群上成功
+         → 下一次操作恢复正常延迟
+```
+
+### 推荐的应用程序代码模式
+
+#### 模式 1: 记录并继续(✅ 推荐)
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class DatabaseService {
+    private static final Logger logger = LoggerFactory.getLogger(DatabaseService.class);
+
+    public void executeOperation(Statement statement, String sql) {
+        try {
+            statement.execute(sql);
+            logger.debug("操作成功");
+
+        } catch (SQLException e) {
+            // 记录以供监控但不要使操作失败
+            logger.warn("数据库操作遇到瞬态错误: {}",
+                e.getMessage());
+
+            // 增加指标计数器
+            metrics.incrementCounter("database.transient_errors");
+
+            // JDBC wrapper 将自动重试(5 次尝试,500ms 退避)
+            // 无需任何操作 - 重试是透明的
+
+            // 可选: 下一次操作前短暂延迟
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+}
+```
+
+**为什么这有效:**
+- 应用程序观察到错误(用于警报/监控)
+- 但不会使事务失败
+- JDBC wrapper 重试自动处理恢复
+- 下一次操作在 wrapper 重新连接后成功
+
+#### 模式 2: 应用程序级重试(⚠️ 不推荐)
+
+```java
+public void executeWithRetry(Statement statement, String sql) {
+    int maxRetries = 3;
+    for (int i = 0; i < maxRetries; i++) {
+        try {
+            statement.execute(sql);
+            return; // 成功
+        } catch (SQLException e) {
+            if (i == maxRetries - 1) {
+                throw new DatabaseException("重试后失败", e);
+            }
+            logger.warn("重试 {}/{}: {}", i+1, maxRetries, e.getMessage());
+            Thread.sleep(500);
+        }
+    }
+}
+```
+
+**为什么这不必要:**
+- JDBC wrapper 已经重试(5 次尝试,500ms 退避)
+- 添加重复的重试逻辑
+- 可能导致比必要更长的延迟
+- 增加代码复杂性
+
+#### 模式 3: 快速失败(❌ 不推荐用于 Blue-Green)
+
+```java
+public void executeWithFailFast(Statement statement, String sql) {
+    try {
+        statement.execute(sql);
+    } catch (SQLException e) {
+        logger.error("数据库操作失败", e);
+        throw new DatabaseException("操作失败", e);
+    }
+}
+```
+
+**为什么这会失败:**
+- 应用程序永久终止操作
+- JDBC wrapper 重试仍然发生,但应用程序已经失败
+- 在切换期间导致不必要的失败
+- 违反 Blue-Green 零停机时间目标
+
+### 必需的配置
+
+基于 WorkloadSimulator.java 实验室测试:
+
+```java
+// HikariCP 连接池配置
+HikariConfig hikariConfig = new HikariConfig();
+hikariConfig.setConnectionTimeout(30000);      // 30 秒
+hikariConfig.setIdleTimeout(600000);           // 10 分钟
+hikariConfig.setMaxLifetime(1800000);          // 30 分钟
+hikariConfig.setMaximumPoolSize(100);          // 每个 worker 10 个连接
+hikariConfig.setMinimumIdle(10);
+
+// 带有 Blue-Green 插件的 JDBC URL
+String jdbcUrl = "jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/lab_db?" +
+    "wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&" +
+    "connectTimeout=30000&" +          // TCP 连接超时
+    "socketTimeout=30000&" +           // Socket 读取超时
+    "failoverTimeoutMs=60000&" +       // 故障转移完成超时
+    "bgConnectTimeoutMs=30000&" +      // BG 切换连接超时
+    "bgSwitchoverTimeoutMs=180000";    // BG 切换过程超时(3 分钟)
+
+hikariConfig.setJdbcUrl(jdbcUrl);
+```
+
+### 切换期间的预期指标
+
+来自实验室测试(Test 055308 和 070455):
+
+| 指标 | 值 | 注释 |
+|------|-----|------|
+| **纯停机时间** | 27-29ms | 连接不可用窗口 |
+| **捕获错误的 Worker** | 55%(20 个中的 11 个) | 将执行 catch 块 |
+| **未受影响的 Worker** | 45%(20 个中的 9 个) | 未观察到 SQLException |
+| **重试成功率** | 100% | 所有重试在 Green 集群上成功 |
+| **第一次操作延迟** | 2,000-2,100ms | 切换后第一次操作 |
+| **正常延迟** | 2-4ms(写入)<br>0.3-0.7ms(读取) | 第一次操作后返回基线 |
+| **JDBC Wrapper 重试** | 5 次尝试 | 尝试之间 500ms 退避 |
+
+### 生产部署检查清单
+
+**✅ 应该做:**
+- 记录 SQLException 以供监控(warn/info 级别)
+- 在指标中跟踪瞬态错误计数
+- 信任 JDBC wrapper 的自动重试机制
+- 配置连接池超时 ≥ 30 秒
+- 监控延迟峰值(预期第一次操作 2+ 秒)
+- 设置持续错误警报(> 1 分钟)
+
+**❌ 不应该做:**
+- 抛出终止应用程序的异常
+- 实现冗余的应用程序级重试逻辑
+- 使用短超时值(< 15 秒)
+- 在第一次 SQLException 时使操作失败
+- 禁用 JDBC wrapper 重试机制
+
+### 监控和警报
+
+**要跟踪的指标:**
+```java
+// 计数瞬态错误
+metrics.incrementCounter("database.transient_errors",
+    Tags.of("error_type", "connection_changed"));
+
+// 跟踪延迟峰值
+metrics.timer("database.operation_latency").record(duration);
+
+// 警报阈值
+if (transientErrorRate > 100 errors/min for > 2 minutes) {
+    alert("持续的数据库连接问题");
+}
+```
+
+**切换期间的预期:**
+- **11-20 个瞬态错误**(对于 20 worker 配置)
+- **2+ 秒延迟**(第一次操作)
+- **500ms 内恢复**(所有 worker)
+- **10-15 分钟内返回基线**(读取可能需要更长时间)
+
+### 生产代码示例
+
+包含所有最佳实践的完整示例:
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+
+public class ProductionDatabaseService {
+    private static final Logger logger = LoggerFactory.getLogger(ProductionDatabaseService.class);
+    private final MeterRegistry metrics;
+
+    public ProductionDatabaseService(MeterRegistry metrics) {
+        this.metrics = metrics;
+    }
+
+    public void executeOperation(Connection connection, String sql) {
+        long startTime = System.nanoTime();
+
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(sql);
+
+            // 跟踪成功
+            long duration = System.nanoTime() - startTime;
+            metrics.timer("database.operation.success")
+                .record(duration, TimeUnit.NANOSECONDS);
+
+            logger.debug("操作在 {}ms 内成功", duration / 1_000_000);
+
+        } catch (SQLException e) {
+            // 记录瞬态错误以供监控
+            logger.warn("数据库操作遇到瞬态错误(JDBC wrapper 将重试): {} - {}",
+                e.getSQLState(), e.getMessage());
+
+            // 跟踪瞬态错误以供警报
+            metrics.counter("database.transient_errors",
+                "error_code", e.getSQLState(),
+                "error_type", "connection_changed").increment();
+
+            // 不要抛出 - 让 JDBC wrapper 重试机制处理它
+            // wrapper 将重试最多 5 次,500ms 退避
+
+            // 可选: 下一次操作前短暂延迟
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+}
+```
 
 ---
 
