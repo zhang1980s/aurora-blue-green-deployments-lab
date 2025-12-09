@@ -150,7 +150,7 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `bg` (Blue-Green): 监控 Blue-Green 部署状态以实现协调切换
   - `failover2`: 处理集群级故障转移场景（版本 2）
   - `efm2` (Enhanced Failure Monitoring v2): 主动连接健康监控
-- ☐ `bgdId=1` (或自动检测)
+
 
 #### ☐ 5. 日志配置（测试/预发布环境）
 
@@ -256,7 +256,6 @@ aws rds create-blue-green-deployment \
 }
 ```
 
-**记录部署 ID:** `bgd-_________________`
 
 #### 操作 3.2: 监控部署进度
 ```bash
@@ -293,7 +292,7 @@ aws cloudwatch get-metric-statistics \
 - ☐ 状态 = `AVAILABLE`
 - ☐ 复制延迟 < 1 秒
 - ☐ Green 集群端点可访问
-- ☐ 应用程序日志显示: `[bgdId: '1'] BG status: CREATED` 或 `PREPARATION`
+- ☐ 应用程序日志显示: `[bgdId: '1'] BG status: CREATED`
 
 ---
 
@@ -329,8 +328,6 @@ aws rds describe-blue-green-deployments \
 **发送通知:**
 - 切换开始时间: `<timestamp>`
 - 预期停机时间: 几秒钟
-- 预期影响: 55% 的 worker 经历瞬态错误（自动恢复）
-- 监控仪表板: `<link>`
 
 ### 步骤 5: 执行切换
 
@@ -368,19 +365,16 @@ aws rds switchover-blue-green-deployment \
 T+0s:  切换触发
 T+3-4s: PREPARATION 阶段（无应用程序影响）
 T+5-6s: IN_PROGRESS 阶段（几秒钟停机时间）
-        - 55% 的 worker 经历瞬态错误
         - 自动重试，500ms 退避
         - 预期 100% 恢复
 T+7s:   POST 阶段（稳定化）
         - 所有 worker 在 Green 集群上运行
-        - 读延迟可能升高（+57-133%）
 T+55s:  COMPLETED 阶段
 ```
 
 #### 操作 5.3: 观察 Worker 行为
 
 **监控预期模式:**
-- ☐ ~55% 的 worker 记录连接错误（瞬态）
 - ☐ 错误包含: "The active SQL connection has changed"
 - ☐ Worker 在 500ms 内自动重试
 - ☐ 所有 worker 成功重新连接到新主机
@@ -421,7 +415,7 @@ aws rds describe-blue-green-deployments \
 
 ### 步骤 7: 性能验证（T+5 到 T+15 分钟）
 
-#### 操作 7.1: 监控读延迟（关键）
+#### 操作 7.1: 监控读延迟
 
 **收集切换后读延迟:**
 ```bash

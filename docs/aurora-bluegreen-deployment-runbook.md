@@ -17,9 +17,7 @@
 4. [Blue-Green Deployment Creation](#blue-green-deployment-creation)
 5. [Switchover Execution](#switchover-execution)
 6. [Post-Switchover Validation](#post-switchover-validation)
-7. [Rollback Procedures](#rollback-procedures)
-8. [Troubleshooting](#troubleshooting)
-9. [Success Criteria](#success-criteria)
+7. [Success Criteria](#success-criteria)
 
 ---
 
@@ -258,7 +256,6 @@ aws rds create-blue-green-deployment \
 }
 ```
 
-**Record Deployment ID:** `bgd-_________________`
 
 #### Action 3.2: Monitor Deployment Progress
 ```bash
@@ -331,7 +328,6 @@ aws rds describe-blue-green-deployments \
 **Send notification:**
 - Switchover starting at: `<timestamp>`
 - Expected downtime: few seconds
-- Monitoring dashboard: `<link>`
 
 ### Step 5: Execute Switchover
 
@@ -715,7 +711,6 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
    ```
 
 ---
-
 
 ## Document Revision History
 
