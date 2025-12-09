@@ -202,8 +202,8 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 -  谨慎启用写入操作（可能导致复制冲突）
 -  避免切换后可能成为生产数据的非预期数据
 
-**模式更改兼容性:**
--  仅进行复制兼容的模式更改
+**Schema更改兼容性:**
+-  仅进行replication-compatible schema更改
 -  **兼容**: 在表末尾添加新列
 -  **不兼容**: 重命名列或表（破坏复制）
 -  参考: [MySQL 不同表定义的复制](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
