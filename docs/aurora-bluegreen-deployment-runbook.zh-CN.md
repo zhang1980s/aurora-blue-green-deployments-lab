@@ -38,7 +38,7 @@
 
 ### 先决条件验证
 
-#### ☐ 0. AWS Advanced JDBC Wrapper 版本
+####  0. AWS Advanced JDBC Wrapper 版本
 
 **要求**: 应用程序必须使用 AWS Advanced JDBC Wrapper **版本 2.6.8 或更高版本**。
 
@@ -66,7 +66,7 @@ grep -A 2 "aws-advanced-jdbc-wrapper" pom.xml
 
 **功能验证实验使用版本**: 2.6.8
 
-#### ☐ 1. 数据库用户权限
+####  1. 数据库用户权限
 
 **在 Blue 和 Green 集群上验证权限:**
 ```sql
@@ -92,7 +92,7 @@ SET DEFAULT ROLE 'bluegreen_reader' TO 'your_app_user'@'%';
 FLUSH PRIVILEGES;
 ```
 
-#### ☐ 2. 二进制日志配置
+####  2. 二进制日志配置
 
 **检查二进制日志状态:**
 ```sql
@@ -114,7 +114,7 @@ aws rds describe-db-clusters \
   --query 'DBClusters[0].DBClusterParameterGroup'
 ```
 
-#### ☐ 3. 多线程复制（推荐）
+####  3. 多线程复制（推荐）
 
 **检查当前设置:**
 ```sql
@@ -134,7 +134,7 @@ aws rds modify-db-cluster-parameter-group \
   --parameters "ParameterName=replica_parallel_workers,ParameterValue=4,ApplyMethod=immediate"
 ```
 
-#### ☐ 4. 应用程序配置
+####  4. 应用程序配置
 
 **验证 JDBC URL 包含 Blue-Green 插件:**
 ```
@@ -144,7 +144,7 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
 **注意**: 此示例仅显示必需的 `wrapperPlugins` 参数。请在实际连接字符串中保留任何其他现有的 JDBC 参数（例如 `connectTimeout`、`socketTimeout` 等）。
 
 **关键参数检查清单:**
-- ☐ `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
+-  `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
   - `initialConnection`: 建立初始连接属性和验证
   - `auroraConnectionTracker`: 跟踪 Aurora 集群拓扑和连接状态
   - `bg` (Blue-Green): 监控 Blue-Green 部署状态以实现协调切换
@@ -152,7 +152,7 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `efm2` (Enhanced Failure Monitoring v2): 主动连接健康监控
 
 
-#### ☐ 5. 日志配置（测试/预发布环境）
+####  5. 日志配置（测试/预发布环境）
 
 **启用 Blue-Green 插件的调试日志:**
 
@@ -174,7 +174,7 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 </Logger>
 ```
 
-#### ☐ 6. 监控设置
+####  6. 监控设置
 
 **要监控的 CloudWatch 指标:**
 - `DatabaseConnections`（当前连接数）
@@ -187,26 +187,26 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 - 事务成功/失败率
 - P50、P95、P99 延迟
 
-#### ☐ 7. 通用最佳实践验证
+####  7. 通用最佳实践验证
 
 在继续 Blue-Green 部署之前，验证以下最佳实践:
 
 **连接策略:**
-- ☐ 对所有连接使用集群端点、读取器端点或自定义端点
-- ☐ 不要使用实例端点
-- ☐ 不要使用带有静态或排除列表的自定义端点
-- ☐ 确保无缝切换，无需更改连接字符串
+-  对所有连接使用集群端点、读取器端点或自定义端点
+-  不要使用实例端点
+-  不要使用带有静态或排除列表的自定义端点
+-  确保无缝切换，无需更改连接字符串
 
 **Green 环境使用:**
-- ☐ 在切换之前保持 green 环境为只读
-- ☐ 谨慎启用写入操作（可能导致复制冲突）
-- ☐ 避免切换后可能成为生产数据的非预期数据
+-  在切换之前保持 green 环境为只读
+-  谨慎启用写入操作（可能导致复制冲突）
+-  避免切换后可能成为生产数据的非预期数据
 
 **模式更改兼容性:**
-- ☐ 仅进行复制兼容的模式更改
-- ☐ **兼容**: 在表末尾添加新列
-- ☐ **不兼容**: 重命名列或表（破坏复制）
-- ☐ 参考: [MySQL 不同表定义的复制](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
+-  仅进行复制兼容的模式更改
+-  **兼容**: 在表末尾添加新列
+-  **不兼容**: 重命名列或表（破坏复制）
+-  参考: [MySQL 不同表定义的复制](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
 
 ---
 
@@ -310,10 +310,10 @@ aws cloudwatch get-metric-statistics \
 ```
 
 **Green 集群就绪条件:**
-- ☐ 状态 = `AVAILABLE`
-- ☐ 复制延迟 < 1 秒
-- ☐ Green 集群端点可访问
-- ☐ 应用程序日志显示: `[bgdId: '1'] BG status: CREATED`
+-  状态 = `AVAILABLE`
+-  复制延迟 < 1 秒
+-  Green 集群端点可访问
+-  应用程序日志显示: `[bgdId: '1'] BG status: CREATED`
 
 #### 操作 3.4: 管理复制延迟（如适用）
 
@@ -368,10 +368,10 @@ aws rds modify-db-parameter-group \
 ```
 
 **健康检查:**
-- ☐ 应用程序日志显示无连接错误
-- ☐ 连接池利用率 < 80%
-- ☐ 事务成功率 > 99.9%
-- ☐ 没有正在进行的手动事务
+-  应用程序日志显示无连接错误
+-  连接池利用率 < 80%
+-  事务成功率 > 99.9%
+-  没有正在进行的手动事务
 
 #### 操作 4.2: 验证部署状态
 ```bash
@@ -433,10 +433,10 @@ T+55s:  COMPLETED 阶段
 #### 操作 5.3: 观察 Worker 行为
 
 **监控预期模式:**
-- ☐ 错误包含: "The active SQL connection has changed"
-- ☐ Worker 在 500ms 内自动重试
-- ☐ 所有 worker 成功重新连接到新主机
-- ☐ 切换后第一次操作: ~2-2.1 秒延迟（正常）
+-  错误包含: "The active SQL connection has changed"
+-  Worker 在 500ms 内自动重试
+-  所有 worker 成功重新连接到新主机
+-  切换后第一次操作: ~2-2.1 秒延迟（正常）
 
 ---
 
@@ -457,10 +457,10 @@ SELECT @@aurora_version;
 
 #### 操作 6.2: 检查应用程序健康状态
 **在应用程序日志中验证:**
-- ☐ 所有 worker 正常运行
-- ☐ 没有持续的连接错误
-- ☐ 事务成功率 = 100%
-- ☐ 新主机已确认: `ip-10-x-x-x`（与旧主机不同）
+-  所有 worker 正常运行
+-  没有持续的连接错误
+-  事务成功率 = 100%
+-  新主机已确认: `ip-10-x-x-x`（与旧主机不同）
 
 #### 操作 6.3: 验证部署状态
 ```bash
@@ -534,21 +534,21 @@ SHOW REPLICA STATUS\G
 ### 部署成功检查清单
 
 #### 技术成功标准
-- ☐ 纯停机时间: 几秒钟
-- ☐ 永久失败事务: 0
-- ☐ 事务成功率: 100%（重试后）
-- ☐ Aurora 版本已升级: ✅（用 `SELECT @@aurora_version;` 验证）
-- ☐ 写延迟不变: ✅（保持 2-4ms 基线）
-- ☐ 所有 worker 已恢复: ✅
-- ☐ Blue-Green 生命周期已完成: ✅（NOT_CREATED → COMPLETED）
+-  纯停机时间: 几秒钟
+-  永久失败事务: 0
+-  事务成功率: 100%（重试后）
+-  Aurora 版本已升级: ✅（用 `SELECT @@aurora_version;` 验证）
+-  写延迟不变: ✅（保持 2-4ms 基线）
+-  所有 worker 已恢复: ✅
+-  Blue-Green 生命周期已完成: ✅（NOT_CREATED → COMPLETED）
 
 #### 运维成功标准
-- ☐ 零手动干预
-- ☐ 无需应用程序代码更改
-- ☐ 客户无可见错误
-- ☐ 无数据丢失或损坏
-- ☐ 监控仪表板显示健康状态
-- ☐ 旧 Blue 集群准备好退役
+-  零手动干预
+-  无需应用程序代码更改
+-  客户无可见错误
+-  无数据丢失或损坏
+-  监控仪表板显示健康状态
+-  旧 Blue 集群准备好退役
 
 ---
 
@@ -560,10 +560,10 @@ SHOW REPLICA STATUS\G
 
 #### 操作 9.1: 最终验证
 **验证 Green 集群稳定性:**
-- ☐ 24+ 小时稳定运行
-- ☐ 无意外错误或降级
-- ☐ 读延迟恢复到可接受水平
-- ☐ 所有监控指标健康
+-  24+ 小时稳定运行
+-  无意外错误或降级
+-  读延迟恢复到可接受水平
+-  所有监控指标健康
 
 #### 操作 9.2: 删除 Blue-Green 部署
 ```bash
