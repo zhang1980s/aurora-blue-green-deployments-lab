@@ -17,9 +17,7 @@
 4. [Blue-Green 部署创建](#blue-green-部署创建)
 5. [切换执行](#切换执行)
 6. [切换后验证](#切换后验证)
-7. [回滚流程](#回滚流程)
-8. [故障排除](#故障排除)
-9. [成功标准](#成功标准)
+7. [成功标准](#成功标准)
 
 ---
 
@@ -70,13 +68,15 @@ grep -A 2 "aws-advanced-jdbc-wrapper" pom.xml
 
 #### ☐ 1. 数据库用户权限
 
-**在源集群上验证权限:**
+**在 Blue 和 Green 集群上验证权限:**
 ```sql
 -- 测试访问拓扑表
 SELECT * FROM mysql.rds_topology LIMIT 1;
 ```
 
 **预期结果**: 查询成功返回（即使为空）
+
+**重要**: 这些权限必须在 Blue 和 Green 集群上都授予，切换后不应撤销。
 
 **如果访问被拒绝 - 授予权限:**
 ```sql
@@ -148,16 +148,24 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `bg` (Blue-Green): 监控 Blue-Green 部署状态以实现协调切换
   - `failover2`: 处理集群级故障转移场景（版本 2）
   - `efm2` (Enhanced Failure Monitoring v2): 主动连接健康监控
+- ☐ `bgdId=1` (或自动检测)
 
 #### ☐ 5. 日志配置（测试/预发布环境）
 
 **启用 Blue-Green 插件的调试日志:**
+
+**选项 1: 在 JDBC URL 中配置**
+```
+jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&wrapperLoggerLevel=FINE
+```
+
+**选项 2: Java 应用程序代码**
 ```java
 // Java 应用程序 - 添加到启动代码
 java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setLevel(Level.FINE);
 ```
 
-**Log4j2 配置:**
+**选项 3: Log4j2 配置**
 ```xml
 <Logger name="software.amazon.jdbc.plugin.bluegreen" level="FINE" additivity="false">
   <AppenderRef ref="Console"/>
@@ -467,184 +475,6 @@ SHOW REPLICA STATUS\G
 
 ---
 
-## 回滚流程
-
-### 场景 1: 切换前回滚
-
-**用例:** Green 集群未就绪，或在 PREPARATION 期间检测到问题
-
-#### 操作: 删除 Blue-Green 部署
-```bash
-aws rds delete-blue-green-deployment \
-  --blue-green-deployment-identifier <deployment-id> \
-  --delete-target true
-```
-
-**结果:**
-- Green 集群已删除
-- Blue 集群保持为主集群（无影响）
-- 应用程序继续正常操作
-
-### 场景 2: 切换后回滚
-
-**用例:** 切换后发现关键问题（1-2 小时内）
-
-#### 步骤 1: 评估情况
-**需要回滚的关键问题:**
-- 应用程序错误 > 5% 持续超过 5 分钟
-- 读延迟 > 基线的 200%，持续 30 分钟后
-- 检测到数据不一致
-- 关键应用程序功能损坏
-
-#### 步骤 2: 创建反向 Blue-Green 部署
-```bash
-# 使用 Green（当前）作为源创建新部署
-aws rds create-blue-green-deployment \
-  --blue-green-deployment-name rollback-deployment \
-  --source-arn arn:aws:rds:<region>:<account-id>:cluster:<green-cluster-id> \
-  --target-engine-version 8.0.mysql_aurora.3.04.4
-
-# 等待部署就绪（15-60 分钟）
-
-# 执行切换回原始版本
-aws rds switchover-blue-green-deployment \
-  --blue-green-deployment-identifier <new-deployment-id>
-```
-
-**注意:** 回滚遵循相同的切换流程（预期 27-29ms 停机时间）
-
-### 场景 3: 紧急回滚（手动故障转移）
-
-**用例:** Blue-Green 部署卡住或无响应
-
-#### 操作: 手动故障转移到旧 Blue 集群
-```bash
-# 1. 更新应用程序 JDBC URL 指向旧 Blue 集群端点
-# 2. 使用更新的配置重启应用程序
-# 3. 删除卡住的 Blue-Green 部署
-aws rds delete-blue-green-deployment \
-  --blue-green-deployment-identifier <deployment-id> \
-  --delete-target false
-```
-
-**警告:** 此方法导致 **11-20 秒** 停机时间（无 Blue-Green 插件协调）
-
----
-
-## 故障排除
-
-### 问题 1: 部署创建失败
-
-**症状:**
-```
-Error: Binary logging is not enabled on the source cluster
-```
-
-**解决方案:**
-1. 启用二进制日志（参见部署前检查清单 #2）
-2. 重启集群
-3. 重试部署创建
-
----
-
-### 问题 2: PREPARATION 期间复制延迟高
-
-**症状:**
-```
-AuroraBinlogReplicaLag > 10 秒，持续 30 分钟后
-```
-
-**解决方案:**
-1. 检查 `replica_parallel_workers` 设置（应该是 4-16）
-2. 临时减少写工作负载
-3. 等待复制追上（不要触发切换）
-
-**验证:**
-```sql
-SHOW REPLICA STATUS\G
--- 查找: Seconds_Behind_Master < 1
-```
-
----
-
-### 问题 3: 应用程序日志显示持续连接错误
-
-**症状:**
-```
-[ERROR] Worker-X | connection_error | Retry 5/5 failed
-```
-
-**解决方案:**
-1. 验证 Blue-Green 插件已激活:
-```bash
-# 检查 JDBC URL 包含: wrapperPlugins=...bg...
-```
-
-2. 检查部署状态:
-```bash
-aws rds describe-blue-green-deployments \
-  --blue-green-deployment-identifier <deployment-id>
-```
-
-3. 如果 IN_PROGRESS 超过 10 秒 → 潜在问题，密切监控
-4. 如果错误持续超过 30 秒 → 联系 AWS 支持
-
----
-
-### 问题 4: 读延迟持续升高（> 60 分钟）
-
-**症状:**
-```
-读延迟 > 基线的 150%，持续 60 分钟后
-```
-
-**调查:**
-```sql
--- 检查缓冲池使用情况
-SHOW STATUS LIKE 'Innodb_buffer_pool%';
-
--- 检查查询性能
-SHOW FULL PROCESSLIST;
-
--- 检查长时间运行的查询
-SELECT * FROM information_schema.processlist WHERE time > 60;
-```
-
-**解决方案选项:**
-1. **等待更长时间** - 大数据集的缓冲池预热可能需要 2-3 小时
-2. **扩展读副本** - 临时卸载读流量
-3. **优化查询** - 审查慢查询日志
-4. **考虑回滚** - 如果违反业务关键性能 SLA
-
----
-
-### 问题 5: 切换超时
-
-**症状:**
-```
-Error: Switchover operation timed out after 300 seconds
-```
-
-**解决方案:**
-1. 检查部署状态:
-```bash
-aws rds describe-blue-green-deployments \
-  --blue-green-deployment-identifier <deployment-id>
-```
-
-2. 如果状态 = `SWITCHOVER_FAILED`:
-   - Green 集群保持为备用
-   - Blue 集群仍为主集群
-   - 应用程序未受影响
-   - 重试切换或删除部署
-
-3. 如果状态 = `SWITCHOVER_IN_PROGRESS`:
-   - 再等待 5 分钟
-   - 监控应用程序日志
-   - 不要重试或删除部署
-
----
-
 ## 成功标准
 
 ### 部署成功检查清单
@@ -655,8 +485,6 @@ aws rds describe-blue-green-deployments \
 - ☐ 事务成功率: 100%（重试后）
 - ☐ Aurora 版本已升级: ✅（用 `SELECT @@aurora_version;` 验证）
 - ☐ 写延迟不变: ✅（保持 2-4ms 基线）
-- ☐ 读延迟升高但正在稳定: ⚠️（57-133% 增加可接受）
-- ☐ Worker 受影响: ~55%（20 个 worker 中有 11 个受影响，预期）
 - ☐ 所有 worker 已恢复: ✅
 - ☐ Blue-Green 生命周期已完成: ✅（NOT_CREATED → COMPLETED）
 
@@ -667,12 +495,6 @@ aws rds describe-blue-green-deployments \
 - ☐ 无数据丢失或损坏
 - ☐ 监控仪表板显示健康状态
 - ☐ 旧 Blue 集群准备好退役
-
-#### 业务成功标准
-- ☐ 维护 SLA（如果 < 100ms 停机时间）
-- ☐ 无客户投诉
-- ☐ 无收入影响
-- ☐ 在维护窗口内完成升级
 
 ---
 
