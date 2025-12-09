@@ -29,15 +29,22 @@
 This runbook provides step-by-step instructions for executing Aurora MySQL Blue-Green deployments with minimal downtime using the AWS Advanced JDBC Wrapper.
 
 ### Expected Outcomes
-- **Downtime**: 27-29ms (lab-verified)
+- **Downtime**: few seconds, depends on the read workload
 - **Success Rate**: 100% with automatic retry
 - **Failed Transactions**: 0 permanent failures
-- **Worker Impact**: 55% experience transient errors (auto-recoverable)
+- **Worker Impact**: Some workers experience transient errors (auto-recoverable). During the switchover, some worker threads may experience brief connection errors due to the cluster transition. These errors are automatically handled by the JDBC wrapper's failover plugin retry mechanism with no manual intervention required.
 
-### Known Limitations
-- **Read Latency**: Increases 57-133% post-switchover (temporary, 10-15 min recovery)
-- **Cluster Performance**: Varies between physical clusters
-- **Not Supported**: Aurora Global Database, RDS Multi-AZ clusters
+  **Application Error Awareness**: This suggests the JDBC wrapper's retry mechanism works transparently, though the application layer may observe the transient error before the successful retry.
+
+  The exact behavior depends on:
+  - **Application's exception handling**: Does it catch SQLException?
+  - **Connection pool configuration**: Timeout settings (HikariCP defaults: connectionTimeout=30s, idleTimeout=10min, maxLifetime=30min)
+  - **JDBC wrapper retry settings**: Default is 5 retries with 500ms backoff
+
+  **Recommendations for production deployments**:
+  - ✅ Log but not fail on transient database errors
+  - ✅ Trust the JDBC wrapper's automatic retry mechanism
+  - ✅ Monitor latency spikes during switchover (expected: 2+ seconds for first operation)
 
 ---
 
@@ -75,13 +82,15 @@ grep -A 2 "aws-advanced-jdbc-wrapper" pom.xml
 
 #### ☐ 1. Database User Permissions
 
-**Verify permissions on source cluster:**
+**Verify permissions on both Blue and Green clusters:**
 ```sql
 -- Test access to topology table
 SELECT * FROM mysql.rds_topology LIMIT 1;
 ```
 
 **Expected Result**: Query returns successfully (even if empty)
+
+**Important**: These permissions must be granted on both Blue and Green clusters and should NOT be revoked after switchover.
 
 **If Access Denied - Grant Permissions:**
 ```sql
@@ -143,7 +152,7 @@ aws rds modify-db-cluster-parameter-group \
 
 **Verify JDBC URL includes Blue-Green plugin:**
 ```
-jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&bgdId=1&connectTimeout=30000&socketTimeout=30000&failoverTimeoutMs=60000&failoverClusterTopologyRefreshRateMs=2000&bgConnectTimeoutMs=30000&bgSwitchoverTimeoutMs=180000
+jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&connectTimeout=30000&socketTimeout=30000&failoverTimeoutMs=60000&failoverClusterTopologyRefreshRateMs=2000
 ```
 
 **Key Parameters Checklist:**
@@ -154,18 +163,23 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `failover2`: Handles cluster-level failover scenarios (version 2)
   - `efm2` (Enhanced Failure Monitoring v2): Proactive connection health monitoring
 - ☐ `bgdId=1` (or auto-detect)
-- ☐ `bgConnectTimeoutMs=30000`
-- ☐ `bgSwitchoverTimeoutMs=180000`
 
 #### ☐ 5. Logging Configuration (Testing/Staging)
 
 **Enable debug logging for Blue-Green plugin:**
+
+**Option 1: Configure in JDBC URL**
+```
+jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&wrapperLoggerLevel=FINE
+```
+
+**Option 2: Java application code**
 ```java
 // Java application - add to startup code
 java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setLevel(Level.FINE);
 ```
 
-**Log4j2 Configuration:**
+**Option 3: Log4j2 Configuration**
 ```xml
 <Logger name="software.amazon.jdbc.plugin.bluegreen" level="FINE" additivity="false">
   <AppenderRef ref="Console"/>
@@ -226,13 +240,6 @@ aws cloudwatch get-metric-statistics \
   --period 60 \
   --statistics Average
 ```
-
-**Document baseline values:**
-- Current Aurora version: _____________
-- Average read latency: _____________ms
-- Average write latency: _____________ms
-- Connection count: _____________
-- CPU utilization: _____________%
 
 ---
 
@@ -298,7 +305,7 @@ aws cloudwatch get-metric-statistics \
 - ☐ Status = `AVAILABLE`
 - ☐ Replication lag < 1 second
 - ☐ Green cluster endpoint accessible
-- ☐ Application logs show: `[bgdId: '1'] BG status: CREATED` or `PREPARATION`
+- ☐ Application logs show: `[bgdId: '1'] BG status: CREATED`
 
 ---
 
@@ -333,8 +340,7 @@ aws rds describe-blue-green-deployments \
 #### Action 4.3: Notify Stakeholders
 **Send notification:**
 - Switchover starting at: `<timestamp>`
-- Expected downtime: 27-29ms
-- Expected impact: 55% workers experience transient errors (auto-recoverable)
+- Expected downtime: few seconds
 - Monitoring dashboard: `<link>`
 
 ### Step 5: Execute Switchover
@@ -372,20 +378,17 @@ aws rds switchover-blue-green-deployment \
 ```
 T+0s:  Switchover triggered
 T+3-4s: PREPARATION phase (no application impact)
-T+5-6s: IN_PROGRESS phase (27-29ms downtime)
-        - 55% workers experience transient errors
+T+5-6s: IN_PROGRESS phase (few seconds downtime)
         - Automatic retry with 500ms backoff
         - 100% recovery expected
 T+7s:   POST phase (stabilization)
         - All workers operational on Green cluster
-        - Read latency may be elevated (+57-133%)
 T+55s:  COMPLETED phase
 ```
 
 #### Action 5.3: Observe Worker Behavior
 
 **Monitor for expected patterns:**
-- ☐ ~55% workers log connection errors (transient)
 - ☐ Errors contain: "The active SQL connection has changed"
 - ☐ Workers automatically retry within 500ms
 - ☐ All workers successfully reconnect to new host
@@ -426,7 +429,7 @@ aws rds describe-blue-green-deployments \
 
 ### Step 7: Performance Validation (T+5 to T+15 minutes)
 
-#### Action 7.1: Monitor Read Latency (CRITICAL)
+#### Action 7.1: Monitor Read Latency
 
 **Collect post-switchover read latency:**
 ```bash
@@ -440,15 +443,7 @@ aws cloudwatch get-metric-statistics \
   --statistics Average
 ```
 
-**Expected Behavior:**
-- Read latency elevated by **57-133%** from baseline
-- Example: 0.3ms baseline → 0.7ms post-switchover (+133%)
-- Example: 0.7ms baseline → 1.1-1.4ms post-switchover (+57-100%)
-
-**Action Required:**
-- ☐ Monitor for 10-15 minutes to observe stabilization
-- ☐ Alert if latency exceeds baseline by >150%
-- ☐ Consider scaling read replicas if read-heavy workload
+**Expected:** Read latency unchanged
 
 #### Action 7.2: Validate Write Performance
 **Check write latency (should be unchanged):**
@@ -463,7 +458,7 @@ aws cloudwatch get-metric-statistics \
   --statistics Average
 ```
 
-**Expected:** Write latency unchanged (2-4ms typical)
+**Expected:** Write latency unchanged
 
 #### Action 7.3: Database Connection Validation
 ```sql
@@ -479,203 +474,14 @@ SHOW REPLICA STATUS\G
 
 ### Step 8: Extended Monitoring (T+15 to T+60 minutes)
 
-#### Action 8.1: Monitor Read Latency Stabilization
-**Check if read latency returns to baseline:**
-- At T+15 min: Read latency = _______ms
-- At T+30 min: Read latency = _______ms
-- At T+45 min: Read latency = _______ms
-- At T+60 min: Read latency = _______ms
-
-**Evaluation:**
-- ☐ Latency returning to baseline → **Temporary warm-up effect** (expected)
-- ☐ Latency stabilized at elevated level → **Aurora 3.10.2 characteristic or cluster-specific**
-
-#### Action 8.2: Application Performance Review
+#### Action 8.1: Application Performance Review
 **Collect final metrics:**
 ```bash
 # Total operations during switchover window
 # Transaction failure count (should be 0 permanent)
-# Worker affectation rate (expect ~55%)
-# Recovery time (expect < 1 second)
+# Worker affectation rate
+# Recovery time (expect few seconds)
 ```
-
----
-
-## Rollback Procedures
-
-### Scenario 1: Rollback Before Switchover
-
-**Use Case:** Green cluster not ready, or issues detected during PREPARATION
-
-#### Action: Delete Blue-Green Deployment
-```bash
-aws rds delete-blue-green-deployment \
-  --blue-green-deployment-identifier <deployment-id> \
-  --delete-target true
-```
-
-**Result:**
-- Green cluster deleted
-- Blue cluster remains primary (no impact)
-- Application continues normal operations
-
-### Scenario 2: Rollback After Switchover
-
-**Use Case:** Critical issues discovered post-switchover (within 1-2 hours)
-
-#### Step 1: Assess Situation
-**Critical Issues Requiring Rollback:**
-- Application errors > 5% sustained for > 5 minutes
-- Read latency > 200% of baseline after 30 minutes
-- Data inconsistencies detected
-- Critical application functionality broken
-
-#### Step 2: Create Reverse Blue-Green Deployment
-```bash
-# Create new deployment with Green (current) as source
-aws rds create-blue-green-deployment \
-  --blue-green-deployment-name rollback-deployment \
-  --source-arn arn:aws:rds:<region>:<account-id>:cluster:<green-cluster-id> \
-  --target-engine-version 8.0.mysql_aurora.3.04.4
-
-# Wait for deployment ready (15-60 minutes)
-
-# Execute switchover back to original version
-aws rds switchover-blue-green-deployment \
-  --blue-green-deployment-identifier <new-deployment-id>
-```
-
-**Note:** Rollback follows same switchover process (27-29ms downtime expected)
-
-### Scenario 3: Emergency Rollback (Manual Failover)
-
-**Use Case:** Blue-Green deployment stuck or unresponsive
-
-#### Action: Manual Failover to Old Blue Cluster
-```bash
-# 1. Update application JDBC URL to point to old Blue cluster endpoint
-# 2. Restart application with updated configuration
-# 3. Delete stuck Blue-Green deployment
-aws rds delete-blue-green-deployment \
-  --blue-green-deployment-identifier <deployment-id> \
-  --delete-target false
-```
-
-**Warning:** This method results in **11-20 seconds** downtime (no Blue-Green plugin coordination)
-
----
-
-## Troubleshooting
-
-### Issue 1: Deployment Creation Fails
-
-**Symptom:**
-```
-Error: Binary logging is not enabled on the source cluster
-```
-
-**Resolution:**
-1. Enable binary logging (see Pre-Deployment Checklist #2)
-2. Reboot cluster
-3. Retry deployment creation
-
----
-
-### Issue 2: High Replication Lag During PREPARATION
-
-**Symptom:**
-```
-AuroraBinlogReplicaLag > 10 seconds after 30 minutes
-```
-
-**Resolution:**
-1. Check `replica_parallel_workers` setting (should be 4-16)
-2. Reduce write workload temporarily
-3. Wait for replication to catch up (do NOT trigger switchover)
-
-**Verify:**
-```sql
-SHOW REPLICA STATUS\G
--- Look for: Seconds_Behind_Master < 1
-```
-
----
-
-### Issue 3: Application Logs Show Persistent Connection Errors
-
-**Symptom:**
-```
-[ERROR] Worker-X | connection_error | Retry 5/5 failed
-```
-
-**Resolution:**
-1. Verify Blue-Green plugin is active:
-```bash
-# Check JDBC URL contains: wrapperPlugins=...bg...
-```
-
-2. Check deployment status:
-```bash
-aws rds describe-blue-green-deployments \
-  --blue-green-deployment-identifier <deployment-id>
-```
-
-3. If IN_PROGRESS for > 10 seconds → Potential issue, monitor closely
-4. If errors persist > 30 seconds → Contact AWS Support
-
----
-
-### Issue 4: Read Latency Remains Elevated (> 60 minutes)
-
-**Symptom:**
-```
-Read latency > 150% baseline after 60 minutes
-```
-
-**Investigation:**
-```sql
--- Check buffer pool usage
-SHOW STATUS LIKE 'Innodb_buffer_pool%';
-
--- Check query performance
-SHOW FULL PROCESSLIST;
-
--- Check for long-running queries
-SELECT * FROM information_schema.processlist WHERE time > 60;
-```
-
-**Resolution Options:**
-1. **Wait longer** - Buffer pool warm-up may take 2-3 hours for large datasets
-2. **Scale read replicas** - Offload read traffic temporarily
-3. **Optimize queries** - Review slow query log
-4. **Consider rollback** - If business-critical performance SLA breached
-
----
-
-### Issue 5: Switchover Timeout
-
-**Symptom:**
-```
-Error: Switchover operation timed out after 300 seconds
-```
-
-**Resolution:**
-1. Check deployment status:
-```bash
-aws rds describe-blue-green-deployments \
-  --blue-green-deployment-identifier <deployment-id>
-```
-
-2. If status = `SWITCHOVER_FAILED`:
-   - Green cluster remains standby
-   - Blue cluster still primary
-   - Application unaffected
-   - Retry switchover or delete deployment
-
-3. If status = `SWITCHOVER_IN_PROGRESS`:
-   - Wait additional 5 minutes
-   - Monitor application logs
-   - Do NOT retry or delete deployment
 
 ---
 
@@ -684,14 +490,12 @@ aws rds describe-blue-green-deployments \
 ### Deployment Success Checklist
 
 #### Technical Success Criteria
-- ☐ Pure downtime: < 100ms (target: 27-29ms)
+- ☐ Pure downtime: few seconds
 - ☐ Permanent failed transactions: 0
 - ☐ Transaction success rate: 100% (after retry)
 - ☐ Aurora version upgraded: ✅ (verify with `SELECT @@aurora_version;`)
 - ☐ Write latency unchanged: ✅ (2-4ms baseline maintained)
-- ☐ Read latency elevated but stabilizing: ⚠️ (57-133% increase acceptable)
-- ☐ Worker affectation: ~55% (11 of 20 workers affected, expected)
-- ☐ All workers recovered: ✅ (within 1 second)
+- ☐ All workers recovered: ✅
 - ☐ Blue-Green lifecycle completed: ✅ (NOT_CREATED → COMPLETED)
 
 #### Operational Success Criteria
@@ -701,12 +505,6 @@ aws rds describe-blue-green-deployments \
 - ☐ No data loss or corruption
 - ☐ Monitoring dashboards show healthy state
 - ☐ Old Blue cluster ready for decommission
-
-#### Business Success Criteria
-- ☐ SLA maintained (if < 100ms downtime)
-- ☐ No customer complaints
-- ☐ No revenue impact
-- ☐ Upgrade completed within maintenance window
 
 ---
 
@@ -740,14 +538,6 @@ aws rds delete-db-cluster \
   --db-cluster-identifier <old-blue-cluster-id> \
   --skip-final-snapshot
 ```
-
-#### Action 9.3: Update Documentation
-**Document deployment results:**
-- Actual downtime: _______ms
-- Worker affectation rate: _______%
-- Read latency impact: +______%
-- Time to stabilization: _______minutes
-- Lessons learned: _______________________
 
 ---
 
@@ -791,20 +581,17 @@ grep "connection_error" /path/to/application.log | grep "$(date +%Y-%m-%d)" | wc
 
 ### Test 055308 (database-268-a)
 - **Downtime**: 29ms
-- **Baseline Read Latency**: 0.7-0.9ms → 1.1-1.4ms post-switchover (+57-100%)
 - **Workers Affected**: 11 of 20 (7 read + 4 write)
 - **Total Operations**: 117,231 (100% success)
 
 ### Test 070455 (database-268-b)
 - **Downtime**: 27ms (fastest measured)
-- **Baseline Read Latency**: 0.3ms → 0.7ms post-switchover (+133%)
 - **Workers Affected**: 11 of 20 (6 read + 5 write)
 - **Total Operations**: 117,081+ (100% success)
 
 ### Key Findings
-- **Fastest Downtime**: 27ms (65-68% faster than standard failover)
+- **Fastest Downtime**: 27ms
 - **Consistent Worker Affectation**: 55% across both clusters
-- **Read Latency Elevation**: Varies by cluster baseline (57-133%)
 - **Cross-Cluster Validation**: Same plugin behavior on different physical infrastructure
 
 ---
@@ -894,7 +681,7 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 
 ### Expected Log Pattern During Switchover
 
-**Typical Sequence (27-29ms downtime):**
+**Typical Sequence (few seconds downtime):**
 ```
 05:54:07.199  [bgdId: '1'] BG status: PREPARATION
 05:54:11.576  [bgdId: '1'] BG status: IN_PROGRESS
@@ -907,10 +694,10 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 ```
 
 **Key Metrics from Logs:**
-- **Pure Downtime**: Time between first `Switched to new host` and last operation on old host (27-29ms expected)
-- **Workers Affected**: Count of `connection_error` logs (expect ~55% of workers)
-- **Recovery Time**: Time from first error to successful retry (500-600ms expected)
-- **First Operation Latency**: Latency of first operation after switchover (2,000-2,100ms expected)
+- **Pure Downtime**: Time between first `Switched to new host` and last operation on old host (few seconds expected)
+- **Workers Affected**: Count of `connection_error` logs
+- **Recovery Time**: Time from first error to successful retry
+- **First Operation Latency**: Latency of first operation after switchover
 
 **Practical Usage During Switchover:**
 

@@ -29,15 +29,22 @@
 本运维手册提供使用 AWS Advanced JDBC Wrapper 执行 Aurora MySQL Blue-Green 部署的分步说明，实现最小停机时间。
 
 ### 预期结果
-- **停机时间**: 27-29ms（实验室验证）
+- **停机时间**: 几秒钟，取决于读工作负载
 - **成功率**: 100%（自动重试）
 - **失败事务**: 0 个永久失败
-- **Worker 影响**: 55% 经历瞬态错误（自动恢复）
+- **Worker 影响**: 部分 worker 经历瞬态错误（自动恢复）。在切换期间，部分 worker 线程可能会因集群转换而经历短暂的连接错误。这些错误由 JDBC wrapper 的故障转移插件重试机制自动处理，无需手动干预。
 
-### 已知限制
-- **读延迟**: 切换后增加 57-133%（临时，10-15 分钟恢复）
-- **集群性能**: 不同物理集群之间存在差异
-- **不支持**: Aurora Global Database、RDS Multi-AZ 集群
+  **应用程序错误感知**: 这表明 JDBC wrapper 的重试机制透明工作，尽管应用程序层可能会在成功重试之前观察到瞬态错误。
+
+  确切行为取决于:
+  - **应用程序的异常处理**: 是否捕获 SQLException?
+  - **连接池配置**: 超时设置（HikariCP 默认值: connectionTimeout=30s, idleTimeout=10min, maxLifetime=30min）
+  - **JDBC wrapper 重试设置**: 默认为 5 次重试，500ms 退避
+
+  **生产部署建议**:
+  - ✅ 记录但不因瞬态数据库错误而失败
+  - ✅ 信任 JDBC wrapper 的自动重试机制
+  - ✅ 监控切换期间的延迟峰值（预期: 第一次操作 2+ 秒）
 
 ---
 
@@ -143,7 +150,7 @@ aws rds modify-db-cluster-parameter-group \
 
 **验证 JDBC URL 包含 Blue-Green 插件:**
 ```
-jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&bgdId=1&connectTimeout=30000&socketTimeout=30000&failoverTimeoutMs=60000&failoverClusterTopologyRefreshRateMs=2000&bgConnectTimeoutMs=30000&bgSwitchoverTimeoutMs=180000
+jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&connectTimeout=30000&socketTimeout=30000&failoverTimeoutMs=60000&failoverClusterTopologyRefreshRateMs=2000
 ```
 
 **关键参数检查清单:**
@@ -153,9 +160,6 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `bg` (Blue-Green): 监控 Blue-Green 部署状态以实现协调切换
   - `failover2`: 处理集群级故障转移场景（版本 2）
   - `efm2` (Enhanced Failure Monitoring v2): 主动连接健康监控
-- ☐ `bgdId=1`（或自动检测）
-- ☐ `bgConnectTimeoutMs=30000`
-- ☐ `bgSwitchoverTimeoutMs=180000`
 
 #### ☐ 5. 日志配置（测试/预发布环境）
 
@@ -226,13 +230,6 @@ aws cloudwatch get-metric-statistics \
   --period 60 \
   --statistics Average
 ```
-
-**记录基线值:**
-- 当前 Aurora 版本: _____________
-- 平均读延迟: _____________ms
-- 平均写延迟: _____________ms
-- 连接数: _____________
-- CPU 利用率: _____________%
 
 ---
 
@@ -333,7 +330,7 @@ aws rds describe-blue-green-deployments \
 #### 操作 4.3: 通知相关方
 **发送通知:**
 - 切换开始时间: `<timestamp>`
-- 预期停机时间: 27-29ms
+- 预期停机时间: 几秒钟
 - 预期影响: 55% 的 worker 经历瞬态错误（自动恢复）
 - 监控仪表板: `<link>`
 
@@ -372,7 +369,7 @@ aws rds switchover-blue-green-deployment \
 ```
 T+0s:  切换触发
 T+3-4s: PREPARATION 阶段（无应用程序影响）
-T+5-6s: IN_PROGRESS 阶段（27-29ms 停机时间）
+T+5-6s: IN_PROGRESS 阶段（几秒钟停机时间）
         - 55% 的 worker 经历瞬态错误
         - 自动重试，500ms 退避
         - 预期 100% 恢复
@@ -440,15 +437,7 @@ aws cloudwatch get-metric-statistics \
   --statistics Average
 ```
 
-**预期行为:**
-- 读延迟相比基线升高 **57-133%**
-- 示例: 0.3ms 基线 → 0.7ms 切换后（+133%）
-- 示例: 0.7ms 基线 → 1.1-1.4ms 切换后（+57-100%）
-
-**所需操作:**
-- ☐ 监控 10-15 分钟以观察稳定化
-- ☐ 如果延迟超过基线 >150% 则发出警报
-- ☐ 如果是读密集型工作负载，考虑扩展读副本
+**预期:** 读延迟不变
 
 #### 操作 7.2: 验证写性能
 **检查写延迟（应该不变）:**
@@ -463,7 +452,7 @@ aws cloudwatch get-metric-statistics \
   --statistics Average
 ```
 
-**预期:** 写延迟不变（典型值 2-4ms）
+**预期:** 写延迟不变
 
 #### 操作 7.3: 数据库连接验证
 ```sql
@@ -479,24 +468,13 @@ SHOW REPLICA STATUS\G
 
 ### 步骤 8: 扩展监控（T+15 到 T+60 分钟）
 
-#### 操作 8.1: 监控读延迟稳定化
-**检查读延迟是否恢复到基线:**
-- T+15 分钟: 读延迟 = _______ms
-- T+30 分钟: 读延迟 = _______ms
-- T+45 分钟: 读延迟 = _______ms
-- T+60 分钟: 读延迟 = _______ms
-
-**评估:**
-- ☐ 延迟恢复到基线 → **临时预热效应**（预期）
-- ☐ 延迟稳定在升高水平 → **Aurora 3.10.2 特性或集群特定**
-
-#### 操作 8.2: 应用程序性能审查
+#### 操作 8.1: 应用程序性能审查
 **收集最终指标:**
 ```bash
 # 切换窗口期间的总操作数
 # 事务失败计数（应该为 0 个永久失败）
-# Worker 受影响率（预期 ~55%）
-# 恢复时间（预期 < 1 秒）
+# Worker 受影响率
+# 恢复时间（预期几秒钟）
 ```
 
 ---
@@ -684,14 +662,14 @@ aws rds describe-blue-green-deployments \
 ### 部署成功检查清单
 
 #### 技术成功标准
-- ☐ 纯停机时间: < 100ms（目标: 27-29ms）
+- ☐ 纯停机时间: 几秒钟
 - ☐ 永久失败事务: 0
 - ☐ 事务成功率: 100%（重试后）
 - ☐ Aurora 版本已升级: ✅（用 `SELECT @@aurora_version;` 验证）
 - ☐ 写延迟不变: ✅（保持 2-4ms 基线）
 - ☐ 读延迟升高但正在稳定: ⚠️（57-133% 增加可接受）
 - ☐ Worker 受影响: ~55%（20 个 worker 中有 11 个受影响，预期）
-- ☐ 所有 worker 已恢复: ✅（1 秒内）
+- ☐ 所有 worker 已恢复: ✅
 - ☐ Blue-Green 生命周期已完成: ✅（NOT_CREATED → COMPLETED）
 
 #### 运维成功标准
@@ -741,14 +719,6 @@ aws rds delete-db-cluster \
   --skip-final-snapshot
 ```
 
-#### 操作 9.3: 更新文档
-**记录部署结果:**
-- 实际停机时间: _______ms
-- Worker 受影响率: _______%
-- 读延迟影响: +______%
-- 稳定化时间: _______分钟
-- 经验教训: _______________________
-
 ---
 
 ## 附录 A: 快速参考命令
@@ -791,20 +761,17 @@ grep "connection_error" /path/to/application.log | grep "$(date +%Y-%m-%d)" | wc
 
 ### Test 055308 (database-268-a)
 - **Downtime**: 29ms
-- **Baseline Read Latency**: 0.7-0.9ms → 1.1-1.4ms post-switchover (+57-100%)
 - **Workers Affected**: 11 of 20 (7 read + 4 write)
 - **Total Operations**: 117,231 (100% success)
 
 ### Test 070455 (database-268-b)
 - **Downtime**: 27ms (fastest measured)
-- **Baseline Read Latency**: 0.3ms → 0.7ms post-switchover (+133%)
 - **Workers Affected**: 11 of 20 (6 read + 5 write)
 - **Total Operations**: 117,081+ (100% success)
 
 ### Key Findings
-- **Fastest Downtime**: 27ms (65-68% faster than standard failover)
+- **Fastest Downtime**: 27ms
 - **Consistent Worker Affectation**: 55% across both clusters
-- **Read Latency Elevation**: Varies by cluster baseline (57-133%)
 - **Cross-Cluster Validation**: Same plugin behavior on different physical infrastructure
 
 ---
@@ -894,7 +861,7 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 
 ### 切换期间的预期日志模式
 
-**典型序列（27-29ms 停机时间）:**
+**典型序列（几秒钟停机时间）:**
 ```
 05:54:07.199  [bgdId: '1'] BG status: PREPARATION
 05:54:11.576  [bgdId: '1'] BG status: IN_PROGRESS
@@ -907,10 +874,10 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 ```
 
 **从日志中获取的关键指标:**
-- **Pure Downtime**: 第一个 `Switched to new host` 和旧主机上最后一次操作之间的时间（预期 27-29ms）
-- **Workers Affected**: `connection_error` 日志的计数（预期 ~55% 的 worker）
-- **Recovery Time**: 从第一个错误到成功重试的时间（预期 500-600ms）
-- **First Operation Latency**: 切换后第一次操作的延迟（预期 2,000-2,100ms）
+- **Pure Downtime**: 第一个 `Switched to new host` 和旧主机上最后一次操作之间的时间（预期几秒钟）
+- **Workers Affected**: `connection_error` 日志的计数
+- **Recovery Time**: 从第一个错误到成功重试的时间
+- **First Operation Latency**: 切换后第一次操作的延迟
 
 **切换期间的实际使用:**
 
