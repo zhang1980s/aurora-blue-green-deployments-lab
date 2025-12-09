@@ -1,0 +1,953 @@
+# Aurora Blue-Green 部署运维手册
+
+## 文档信息
+
+**文档版本**: 1.0
+**最后更新**: 2025-12-09
+**作者**: Aurora Blue-Green Deployment Lab Project
+**基于**: 跨 2 个集群的 Aurora MySQL 3.04.4 → 3.10.2 实验室验证测试
+
+---
+
+## 目录
+
+1. [概述](#概述)
+2. [部署前检查清单](#部署前检查清单)
+3. [部署准备](#部署准备)
+4. [Blue-Green 部署创建](#blue-green-部署创建)
+5. [切换执行](#切换执行)
+6. [切换后验证](#切换后验证)
+7. [回滚流程](#回滚流程)
+8. [故障排除](#故障排除)
+9. [成功标准](#成功标准)
+
+---
+
+## 概述
+
+### 目的
+本运维手册提供使用 AWS Advanced JDBC Wrapper 执行 Aurora MySQL Blue-Green 部署的分步说明，实现最小停机时间。
+
+### 预期结果
+- **停机时间**: 27-29ms（实验室验证）
+- **成功率**: 100%（自动重试）
+- **失败事务**: 0 个永久失败
+- **Worker 影响**: 55% 经历瞬态错误（自动恢复）
+
+### 已知限制
+- **读延迟**: 切换后增加 57-133%（临时，10-15 分钟恢复）
+- **集群性能**: 不同物理集群之间存在差异
+- **不支持**: Aurora Global Database、RDS Multi-AZ 集群
+
+---
+
+## 部署前检查清单
+
+### 先决条件验证
+
+#### ☐ 0. AWS Advanced JDBC Wrapper 版本
+
+**要求**: 应用程序必须使用 AWS Advanced JDBC Wrapper **版本 2.6.8 或更高版本**。
+
+Blue-Green 插件在 2.6.0 版本中引入，2.6.8+ 版本中进行了稳定性改进。
+
+**验证版本:**
+```bash
+# 检查 pom.xml 中的 Maven 依赖
+grep -A 2 "aws-advanced-jdbc-wrapper" pom.xml
+
+# 预期输出（最低版本）:
+# <artifactId>aws-advanced-jdbc-wrapper</artifactId>
+# <version>2.6.8</version>
+```
+
+**如需更新:**
+```xml
+<!-- pom.xml -->
+<dependency>
+  <groupId>software.amazon.jdbc</groupId>
+  <artifactId>aws-advanced-jdbc-wrapper</artifactId>
+  <version>2.6.8</version>
+</dependency>
+```
+
+**实验室测试版本**: 2.6.8
+
+#### ☐ 1. 数据库用户权限
+
+**在源集群上验证权限:**
+```sql
+-- 测试访问拓扑表
+SELECT * FROM mysql.rds_topology LIMIT 1;
+```
+
+**预期结果**: 查询成功返回（即使为空）
+
+**如果访问被拒绝 - 授予权限:**
+```sql
+-- 选项 A: 直接授权
+GRANT SELECT ON mysql.rds_topology TO 'your_app_user'@'%';
+FLUSH PRIVILEGES;
+
+-- 选项 B: 使用角色（MySQL 8.0+，推荐）
+CREATE ROLE IF NOT EXISTS 'bluegreen_reader';
+GRANT SELECT ON mysql.rds_topology TO 'bluegreen_reader';
+GRANT 'bluegreen_reader' TO 'your_app_user'@'%';
+SET DEFAULT ROLE 'bluegreen_reader' TO 'your_app_user'@'%';
+FLUSH PRIVILEGES;
+```
+
+#### ☐ 2. 二进制日志配置
+
+**检查二进制日志状态:**
+```sql
+SHOW VARIABLES LIKE 'binlog_format';
+```
+
+**预期结果**: `ROW`、`MIXED` 或 `STATEMENT`（推荐 ROW）
+
+**如果未启用:**
+1. 创建/修改数据库集群参数组
+2. 设置 `binlog_format = ROW`
+3. 将参数组关联到集群
+4. **重启集群**（binlog 更改需要）
+
+**验证集群参数组:**
+```bash
+aws rds describe-db-clusters \
+  --db-cluster-identifier <cluster-name> \
+  --query 'DBClusters[0].DBClusterParameterGroup'
+```
+
+#### ☐ 3. 多线程复制（推荐）
+
+**检查当前设置:**
+```sql
+SHOW VARIABLES LIKE 'replica_parallel_workers';
+```
+
+**推荐值:**
+- Instances < 2xlarge: `0` (disabled)
+- Instances 2xlarge - 8xlarge: `4`
+- Instances > 8xlarge: `8-16`
+
+**如需更新（无需重启）:**
+```bash
+# 更新数据库集群参数组
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name <param-group-name> \
+  --parameters "ParameterName=replica_parallel_workers,ParameterValue=4,ApplyMethod=immediate"
+```
+
+#### ☐ 4. 应用程序配置
+
+**验证 JDBC URL 包含 Blue-Green 插件:**
+```
+jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&bgdId=1&connectTimeout=30000&socketTimeout=30000&failoverTimeoutMs=60000&failoverClusterTopologyRefreshRateMs=2000&bgConnectTimeoutMs=30000&bgSwitchoverTimeoutMs=180000
+```
+
+**关键参数检查清单:**
+- ☐ `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
+  - `initialConnection`: 建立初始连接属性和验证
+  - `auroraConnectionTracker`: 跟踪 Aurora 集群拓扑和连接状态
+  - `bg` (Blue-Green): 监控 Blue-Green 部署状态以实现协调切换
+  - `failover2`: 处理集群级故障转移场景（版本 2）
+  - `efm2` (Enhanced Failure Monitoring v2): 主动连接健康监控
+- ☐ `bgdId=1`（或自动检测）
+- ☐ `bgConnectTimeoutMs=30000`
+- ☐ `bgSwitchoverTimeoutMs=180000`
+
+#### ☐ 5. 日志配置（测试/预发布环境）
+
+**启用 Blue-Green 插件的调试日志:**
+```java
+// Java 应用程序 - 添加到启动代码
+java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setLevel(Level.FINE);
+```
+
+**Log4j2 配置:**
+```xml
+<Logger name="software.amazon.jdbc.plugin.bluegreen" level="FINE" additivity="false">
+  <AppenderRef ref="Console"/>
+</Logger>
+```
+
+#### ☐ 6. 监控设置
+
+**要监控的 CloudWatch 指标:**
+- `DatabaseConnections`（当前连接数）
+- `CPUUtilization`（集群负载）
+- `AuroraBinlogReplicaLag`（PREPARATION 期间的复制延迟）
+- `ReadLatency` 和 `WriteLatency`（性能基线）
+
+**要跟踪的应用程序指标:**
+- 连接池使用率
+- 事务成功/失败率
+- P50、P95、P99 延迟
+
+---
+
+## 部署准备
+
+### 步骤 1: 部署带有 Blue-Green 插件的应用程序
+
+**时间安排**: 切换前 1-2 小时
+
+#### 操作 1.1: 更新应用程序配置
+```bash
+# 更新 JDBC URL 以包含 'bg' 插件
+# 通过滚动重启部署更新的应用程序
+```
+
+#### 操作 1.2: 验证插件激活
+**检查应用程序日志中的内容:**
+```
+[bgdId: '1'] BG status: NOT_CREATED
+```
+
+**等待 5-10 分钟**，让插件初始化并建立基线监控。
+
+### 步骤 2: 建立性能基线
+
+**时间安排**: 创建 Blue-Green 部署前 10 分钟
+
+#### 操作 2.1: 收集当前指标
+```bash
+# 查询当前 Aurora 版本
+mysql -h <cluster-endpoint> -u <user> -p<password> -e "SELECT @@aurora_version;"
+
+# 收集基线指标
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name ReadLatency \
+  --dimensions Name=DBClusterIdentifier,Value=<cluster-id> \
+  --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 60 \
+  --statistics Average
+```
+
+**记录基线值:**
+- 当前 Aurora 版本: _____________
+- 平均读延迟: _____________ms
+- 平均写延迟: _____________ms
+- 连接数: _____________
+- CPU 利用率: _____________%
+
+---
+
+## Blue-Green 部署创建
+
+### 步骤 3: 创建 Blue-Green 部署
+
+**时间安排**: Green 集群就绪需要 15-60 分钟
+
+#### 操作 3.1: 启动部署
+```bash
+aws rds create-blue-green-deployment \
+  --blue-green-deployment-name <deployment-name> \
+  --source-arn arn:aws:rds:<region>:<account-id>:cluster:<source-cluster-id> \
+  --target-engine-version 8.0.mysql_aurora.3.10.0 \
+  --tags Key=Environment,Value=production Key=Deployment,Value=blue-green-upgrade
+```
+
+**预期输出:**
+```json
+{
+  "BlueGreenDeployment": {
+    "BlueGreenDeploymentIdentifier": "bgd-xxxxxxxxxxxxx",
+    "Status": "PROVISIONING"
+  }
+}
+```
+
+**记录部署 ID:** `bgd-_________________`
+
+#### 操作 3.2: 监控部署进度
+```bash
+# 检查部署状态（每 5 分钟重复一次）
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id> \
+  --query 'BlueGreenDeployments[0].Status'
+```
+
+**预期状态进展:**
+1. `PROVISIONING`（5-15 分钟）- 创建 Green 集群
+2. `AVAILABLE`（15-45 分钟）- 复制数据
+3. **准备好切换** 当状态 = `AVAILABLE` 且复制延迟 < 1 秒
+
+#### 操作 3.3: 验证 Green 集群就绪
+```bash
+# 检查 Green 集群详细信息
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id> \
+  --query 'BlueGreenDeployments[0].Target'
+
+# 监控复制延迟（应该 < 1 秒）
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name AuroraBinlogReplicaLag \
+  --dimensions Name=DBClusterIdentifier,Value=<green-cluster-id> \
+  --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 60 \
+  --statistics Average
+```
+
+**Green 集群就绪条件:**
+- ☐ 状态 = `AVAILABLE`
+- ☐ 复制延迟 < 1 秒
+- ☐ Green 集群端点可访问
+- ☐ 应用程序日志显示: `[bgdId: '1'] BG status: CREATED` 或 `PREPARATION`
+
+---
+
+## 切换执行
+
+### 步骤 4: 切换前验证
+
+**时间安排**: 触发切换前立即执行
+
+#### 操作 4.1: 验证应用程序健康状态
+```bash
+# 检查应用程序连接池
+# 验证没有卡住的连接或高错误率
+# 确认工作负载正常运行
+```
+
+**健康检查:**
+- ☐ 应用程序日志显示无连接错误
+- ☐ 连接池利用率 < 80%
+- ☐ 事务成功率 > 99.9%
+- ☐ 没有正在进行的手动事务
+
+#### 操作 4.2: 验证部署状态
+```bash
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id> \
+  --query 'BlueGreenDeployments[0].Status'
+```
+
+**预期:** `AVAILABLE`
+
+#### 操作 4.3: 通知相关方
+**发送通知:**
+- 切换开始时间: `<timestamp>`
+- 预期停机时间: 27-29ms
+- 预期影响: 55% 的 worker 经历瞬态错误（自动恢复）
+- 监控仪表板: `<link>`
+
+### 步骤 5: 执行切换
+
+**时间安排**: 2-7 秒（关键窗口）
+
+#### 操作 5.1: 触发切换
+```bash
+# 执行切换命令
+aws rds switchover-blue-green-deployment \
+  --blue-green-deployment-identifier <deployment-id> \
+  --switchover-timeout 300
+```
+
+**预期输出:**
+```json
+{
+  "BlueGreenDeployment": {
+    "Status": "SWITCHOVER_IN_PROGRESS"
+  }
+}
+```
+
+#### 操作 5.2: 监控切换进度
+
+**实时监控应用程序日志:**
+```bash
+# 查找这些关键日志模式:
+# [bgdId: '1'] BG status: PREPARATION → IN_PROGRESS
+# [bgdId: '1'] BG status: IN_PROGRESS → POST
+# Switched to new host: ip-10-x-x-x
+```
+
+**预期时间线:**
+```
+T+0s:  切换触发
+T+3-4s: PREPARATION 阶段（无应用程序影响）
+T+5-6s: IN_PROGRESS 阶段（27-29ms 停机时间）
+        - 55% 的 worker 经历瞬态错误
+        - 自动重试，500ms 退避
+        - 预期 100% 恢复
+T+7s:   POST 阶段（稳定化）
+        - 所有 worker 在 Green 集群上运行
+        - 读延迟可能升高（+57-133%）
+T+55s:  COMPLETED 阶段
+```
+
+#### 操作 5.3: 观察 Worker 行为
+
+**监控预期模式:**
+- ☐ ~55% 的 worker 记录连接错误（瞬态）
+- ☐ 错误包含: "The active SQL connection has changed"
+- ☐ Worker 在 500ms 内自动重试
+- ☐ 所有 worker 成功重新连接到新主机
+- ☐ 切换后第一次操作: ~2-2.1 秒延迟（正常）
+
+---
+
+## 切换后验证
+
+### 步骤 6: 立即验证（T+0 到 T+5 分钟）
+
+#### 操作 6.1: 验证集群版本
+```sql
+-- 连接到集群端点
+mysql -h <cluster-endpoint> -u <user> -p<password>
+
+-- 检查 Aurora 版本
+SELECT @@aurora_version;
+```
+
+**预期:** `3.10.2`（或目标版本）
+
+#### 操作 6.2: 检查应用程序健康状态
+**在应用程序日志中验证:**
+- ☐ 所有 worker 正常运行
+- ☐ 没有持续的连接错误
+- ☐ 事务成功率 = 100%
+- ☐ 新主机已确认: `ip-10-x-x-x`（与旧主机不同）
+
+#### 操作 6.3: 验证部署状态
+```bash
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id> \
+  --query 'BlueGreenDeployments[0].Status'
+```
+
+**预期:** `SWITCHOVER_COMPLETED`
+
+### 步骤 7: 性能验证（T+5 到 T+15 分钟）
+
+#### 操作 7.1: 监控读延迟（关键）
+
+**收集切换后读延迟:**
+```bash
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name ReadLatency \
+  --dimensions Name=DBClusterIdentifier,Value=<cluster-id> \
+  --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 60 \
+  --statistics Average
+```
+
+**预期行为:**
+- 读延迟相比基线升高 **57-133%**
+- 示例: 0.3ms 基线 → 0.7ms 切换后（+133%）
+- 示例: 0.7ms 基线 → 1.1-1.4ms 切换后（+57-100%）
+
+**所需操作:**
+- ☐ 监控 10-15 分钟以观察稳定化
+- ☐ 如果延迟超过基线 >150% 则发出警报
+- ☐ 如果是读密集型工作负载，考虑扩展读副本
+
+#### 操作 7.2: 验证写性能
+**检查写延迟（应该不变）:**
+```bash
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name WriteLatency \
+  --dimensions Name=DBClusterIdentifier,Value=<cluster-id> \
+  --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 60 \
+  --statistics Average
+```
+
+**预期:** 写延迟不变（典型值 2-4ms）
+
+#### 操作 7.3: 数据库连接验证
+```sql
+-- 验证集群拓扑
+SELECT * FROM mysql.ro_replica_status WHERE deployment_type = 'BLUE_GREEN';
+
+-- 检查活动连接
+SHOW PROCESSLIST;
+
+-- 验证复制状态（如适用）
+SHOW REPLICA STATUS\G
+```
+
+### 步骤 8: 扩展监控（T+15 到 T+60 分钟）
+
+#### 操作 8.1: 监控读延迟稳定化
+**检查读延迟是否恢复到基线:**
+- T+15 分钟: 读延迟 = _______ms
+- T+30 分钟: 读延迟 = _______ms
+- T+45 分钟: 读延迟 = _______ms
+- T+60 分钟: 读延迟 = _______ms
+
+**评估:**
+- ☐ 延迟恢复到基线 → **临时预热效应**（预期）
+- ☐ 延迟稳定在升高水平 → **Aurora 3.10.2 特性或集群特定**
+
+#### 操作 8.2: 应用程序性能审查
+**收集最终指标:**
+```bash
+# 切换窗口期间的总操作数
+# 事务失败计数（应该为 0 个永久失败）
+# Worker 受影响率（预期 ~55%）
+# 恢复时间（预期 < 1 秒）
+```
+
+---
+
+## 回滚流程
+
+### 场景 1: 切换前回滚
+
+**用例:** Green 集群未就绪，或在 PREPARATION 期间检测到问题
+
+#### 操作: 删除 Blue-Green 部署
+```bash
+aws rds delete-blue-green-deployment \
+  --blue-green-deployment-identifier <deployment-id> \
+  --delete-target true
+```
+
+**结果:**
+- Green 集群已删除
+- Blue 集群保持为主集群（无影响）
+- 应用程序继续正常操作
+
+### 场景 2: 切换后回滚
+
+**用例:** 切换后发现关键问题（1-2 小时内）
+
+#### 步骤 1: 评估情况
+**需要回滚的关键问题:**
+- 应用程序错误 > 5% 持续超过 5 分钟
+- 读延迟 > 基线的 200%，持续 30 分钟后
+- 检测到数据不一致
+- 关键应用程序功能损坏
+
+#### 步骤 2: 创建反向 Blue-Green 部署
+```bash
+# 使用 Green（当前）作为源创建新部署
+aws rds create-blue-green-deployment \
+  --blue-green-deployment-name rollback-deployment \
+  --source-arn arn:aws:rds:<region>:<account-id>:cluster:<green-cluster-id> \
+  --target-engine-version 8.0.mysql_aurora.3.04.4
+
+# 等待部署就绪（15-60 分钟）
+
+# 执行切换回原始版本
+aws rds switchover-blue-green-deployment \
+  --blue-green-deployment-identifier <new-deployment-id>
+```
+
+**注意:** 回滚遵循相同的切换流程（预期 27-29ms 停机时间）
+
+### 场景 3: 紧急回滚（手动故障转移）
+
+**用例:** Blue-Green 部署卡住或无响应
+
+#### 操作: 手动故障转移到旧 Blue 集群
+```bash
+# 1. 更新应用程序 JDBC URL 指向旧 Blue 集群端点
+# 2. 使用更新的配置重启应用程序
+# 3. 删除卡住的 Blue-Green 部署
+aws rds delete-blue-green-deployment \
+  --blue-green-deployment-identifier <deployment-id> \
+  --delete-target false
+```
+
+**警告:** 此方法导致 **11-20 秒** 停机时间（无 Blue-Green 插件协调）
+
+---
+
+## 故障排除
+
+### 问题 1: 部署创建失败
+
+**症状:**
+```
+Error: Binary logging is not enabled on the source cluster
+```
+
+**解决方案:**
+1. 启用二进制日志（参见部署前检查清单 #2）
+2. 重启集群
+3. 重试部署创建
+
+---
+
+### 问题 2: PREPARATION 期间复制延迟高
+
+**症状:**
+```
+AuroraBinlogReplicaLag > 10 秒，持续 30 分钟后
+```
+
+**解决方案:**
+1. 检查 `replica_parallel_workers` 设置（应该是 4-16）
+2. 临时减少写工作负载
+3. 等待复制追上（不要触发切换）
+
+**验证:**
+```sql
+SHOW REPLICA STATUS\G
+-- 查找: Seconds_Behind_Master < 1
+```
+
+---
+
+### 问题 3: 应用程序日志显示持续连接错误
+
+**症状:**
+```
+[ERROR] Worker-X | connection_error | Retry 5/5 failed
+```
+
+**解决方案:**
+1. 验证 Blue-Green 插件已激活:
+```bash
+# 检查 JDBC URL 包含: wrapperPlugins=...bg...
+```
+
+2. 检查部署状态:
+```bash
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id>
+```
+
+3. 如果 IN_PROGRESS 超过 10 秒 → 潜在问题，密切监控
+4. 如果错误持续超过 30 秒 → 联系 AWS 支持
+
+---
+
+### 问题 4: 读延迟持续升高（> 60 分钟）
+
+**症状:**
+```
+读延迟 > 基线的 150%，持续 60 分钟后
+```
+
+**调查:**
+```sql
+-- 检查缓冲池使用情况
+SHOW STATUS LIKE 'Innodb_buffer_pool%';
+
+-- 检查查询性能
+SHOW FULL PROCESSLIST;
+
+-- 检查长时间运行的查询
+SELECT * FROM information_schema.processlist WHERE time > 60;
+```
+
+**解决方案选项:**
+1. **等待更长时间** - 大数据集的缓冲池预热可能需要 2-3 小时
+2. **扩展读副本** - 临时卸载读流量
+3. **优化查询** - 审查慢查询日志
+4. **考虑回滚** - 如果违反业务关键性能 SLA
+
+---
+
+### 问题 5: 切换超时
+
+**症状:**
+```
+Error: Switchover operation timed out after 300 seconds
+```
+
+**解决方案:**
+1. 检查部署状态:
+```bash
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id>
+```
+
+2. 如果状态 = `SWITCHOVER_FAILED`:
+   - Green 集群保持为备用
+   - Blue 集群仍为主集群
+   - 应用程序未受影响
+   - 重试切换或删除部署
+
+3. 如果状态 = `SWITCHOVER_IN_PROGRESS`:
+   - 再等待 5 分钟
+   - 监控应用程序日志
+   - 不要重试或删除部署
+
+---
+
+## 成功标准
+
+### 部署成功检查清单
+
+#### 技术成功标准
+- ☐ 纯停机时间: < 100ms（目标: 27-29ms）
+- ☐ 永久失败事务: 0
+- ☐ 事务成功率: 100%（重试后）
+- ☐ Aurora 版本已升级: ✅（用 `SELECT @@aurora_version;` 验证）
+- ☐ 写延迟不变: ✅（保持 2-4ms 基线）
+- ☐ 读延迟升高但正在稳定: ⚠️（57-133% 增加可接受）
+- ☐ Worker 受影响: ~55%（20 个 worker 中有 11 个受影响，预期）
+- ☐ 所有 worker 已恢复: ✅（1 秒内）
+- ☐ Blue-Green 生命周期已完成: ✅（NOT_CREATED → COMPLETED）
+
+#### 运维成功标准
+- ☐ 零手动干预
+- ☐ 无需应用程序代码更改
+- ☐ 客户无可见错误
+- ☐ 无数据丢失或损坏
+- ☐ 监控仪表板显示健康状态
+- ☐ 旧 Blue 集群准备好退役
+
+#### 业务成功标准
+- ☐ 维护 SLA（如果 < 100ms 停机时间）
+- ☐ 无客户投诉
+- ☐ 无收入影响
+- ☐ 在维护窗口内完成升级
+
+---
+
+## 部署后清理
+
+### 步骤 9: 退役旧 Blue 集群（可选）
+
+**时间安排:** 稳定运行 24-72 小时后
+
+#### 操作 9.1: 最终验证
+**验证 Green 集群稳定性:**
+- ☐ 24+ 小时稳定运行
+- ☐ 无意外错误或降级
+- ☐ 读延迟恢复到可接受水平
+- ☐ 所有监控指标健康
+
+#### 操作 9.2: 删除 Blue-Green 部署
+```bash
+# 选项 1: 删除部署和旧 Blue 集群
+aws rds delete-blue-green-deployment \
+  --blue-green-deployment-identifier <deployment-id> \
+  --delete-target true
+
+# 选项 2: 保留旧 Blue 集群以延长回滚窗口
+aws rds delete-blue-green-deployment \
+  --blue-green-deployment-identifier <deployment-id> \
+  --delete-target false
+
+# 稍后手动删除旧集群
+aws rds delete-db-cluster \
+  --db-cluster-identifier <old-blue-cluster-id> \
+  --skip-final-snapshot
+```
+
+#### 操作 9.3: 更新文档
+**记录部署结果:**
+- 实际停机时间: _______ms
+- Worker 受影响率: _______%
+- 读延迟影响: +______%
+- 稳定化时间: _______分钟
+- 经验教训: _______________________
+
+---
+
+## 附录 A: 快速参考命令
+
+### 检查 Aurora 版本
+```sql
+SELECT @@aurora_version;
+```
+
+### 监控 Blue-Green 状态
+```bash
+aws rds describe-blue-green-deployments \
+  --blue-green-deployment-identifier <deployment-id>
+```
+
+### 检查复制延迟
+```bash
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name AuroraBinlogReplicaLag \
+  --dimensions Name=DBClusterIdentifier,Value=<cluster-id> \
+  --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 60 \
+  --statistics Average
+```
+
+### 应用程序健康检查
+```bash
+# 验证 Blue-Green 插件已激活
+grep "BG status:" /path/to/application.log | tail -5
+
+# 统计切换期间的连接错误
+grep "connection_error" /path/to/application.log | grep "$(date +%Y-%m-%d)" | wc -l
+```
+
+---
+
+## 附录 B: 实验室验证结果
+
+### Test 055308 (database-268-a)
+- **Downtime**: 29ms
+- **Baseline Read Latency**: 0.7-0.9ms → 1.1-1.4ms post-switchover (+57-100%)
+- **Workers Affected**: 11 of 20 (7 read + 4 write)
+- **Total Operations**: 117,231 (100% success)
+
+### Test 070455 (database-268-b)
+- **Downtime**: 27ms (fastest measured)
+- **Baseline Read Latency**: 0.3ms → 0.7ms post-switchover (+133%)
+- **Workers Affected**: 11 of 20 (6 read + 5 write)
+- **Total Operations**: 117,081+ (100% success)
+
+### Key Findings
+- **Fastest Downtime**: 27ms (65-68% faster than standard failover)
+- **Consistent Worker Affectation**: 55% across both clusters
+- **Read Latency Elevation**: Varies by cluster baseline (57-133%)
+- **Cross-Cluster Validation**: Same plugin behavior on different physical infrastructure
+
+---
+
+## 附录 C: Blue-Green 阶段日志关键字
+
+使用这些关键字在应用程序日志中识别 Blue-Green 切换阶段并跟踪切换时间线。
+
+### 阶段转换关键字
+
+**Blue-Green 状态更改:**
+```
+[bgdId: '1'] BG status: NOT_CREATED
+[bgdId: '1'] BG status: CREATED
+[bgdId: '1'] BG status: PREPARATION
+[bgdId: '1'] BG status: IN_PROGRESS     ← Critical switchover window begins
+[bgdId: '1'] BG status: POST            ← Switchover completed
+[bgdId: '1'] BG status: COMPLETED
+```
+
+**时间线标记:**
+- `NOT_CREATED → CREATED` - 检测到 Blue-Green 部署
+- `CREATED → PREPARATION` - 正在准备 Green 集群（无应用程序影响）
+- `PREPARATION → IN_PROGRESS` - 启动主动切换（停机窗口）
+- `IN_PROGRESS → POST` - 切换完成，开始稳定化
+- `POST → COMPLETED` - 部署完成，旧环境可以退役
+
+### 连接事件关键字
+
+**主机切换:**
+```
+Switched to new host: ip-10-x-x-x        ← Worker successfully connected to Green cluster
+Routing connections to GREEN_WRITER
+Suspending new connections               ← IN_PROGRESS phase detected
+```
+
+**故障转移事件:**
+```
+Failover                                 ← Connection failover triggered
+The active SQL connection has changed    ← Typical error during switchover
+connection_error                         ← Connection failure logged
+Retry 1/5                               ← Automatic retry with backoff
+```
+
+### 性能标记关键字
+
+**操作结果:**
+```
+SUCCESS: Worker-X | Host: ip-10-x-x-x   ← Successful operation
+ERROR: Worker-X | connection_lost       ← Transient error during switchover
+Latency: 2,062ms                        ← First operation after switchover (elevated)
+Latency: 2-4ms                          ← Normal operation latency
+```
+
+**统计信息:**
+```
+STATS: Total: X | Success: Y | Failed: Z | Success Rate: 100.00%
+```
+
+### 搜索命令
+
+**查找 Blue-Green 阶段转换:**
+```bash
+# 搜索所有阶段转换
+grep "BG status:" /path/to/application.log
+
+# 查找切换窗口
+grep -A 5 "IN_PROGRESS" /path/to/application.log
+
+# 识别切换期间的连接错误
+grep "connection_error\|active SQL connection" /path/to/application.log | grep "$(date +%Y-%m-%d)"
+
+# 统计受影响的 worker
+grep "Retry 1/5" /path/to/application.log | wc -l
+
+# 查找切换后的第一个新连接
+grep "Switched to new host" /path/to/application.log | head -1
+```
+
+**时间线重建:**
+```bash
+# 提取完整的切换时间线
+grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9]{4}" /path/to/application.log | \
+  grep "$(date +%Y-%m-%d)" | \
+  awk '{print $1, $2, $0}'
+```
+
+### 切换期间的预期日志模式
+
+**典型序列（27-29ms 停机时间）:**
+```
+05:54:07.199  [bgdId: '1'] BG status: PREPARATION
+05:54:11.576  [bgdId: '1'] BG status: IN_PROGRESS
+05:54:13.689  Switched to new host: ip-10-5-2-57 (first new connection)
+05:54:13.709  ERROR: Worker-5 | connection_error | The active SQL connection has changed
+05:54:13.718  SUCCESS: Worker-10 | Host: ip-10-5-2-22 (last old connection)
+05:54:14.210  SUCCESS: Worker-5 | Host: ip-10-5-2-57 | Retry 1/5 | Latency: 2-4ms
+05:54:13.652  [bgdId: '1'] BG status: POST
+05:55:09.280  [bgdId: '1'] BG status: COMPLETED
+```
+
+**从日志中获取的关键指标:**
+- **Pure Downtime**: 第一个 `Switched to new host` 和旧主机上最后一次操作之间的时间（预期 27-29ms）
+- **Workers Affected**: `connection_error` 日志的计数（预期 ~55% 的 worker）
+- **Recovery Time**: 从第一个错误到成功重试的时间（预期 500-600ms）
+- **First Operation Latency**: 切换后第一次操作的延迟（预期 2,000-2,100ms）
+
+**切换期间的实际使用:**
+
+1. **切换前** - 验证插件已激活:
+   ```bash
+   grep "BG status:" /path/to/application.log | tail -1
+   # 预期: [bgdId: '1'] BG status: CREATED or PREPARATION
+   ```
+
+2. **切换期间** - 实时监控（在单独的终端中打开）:
+   ```bash
+   tail -f /path/to/application.log | grep --line-buffered -E "BG status:|Switched|connection_error|ERROR"
+   ```
+
+3. **切换后** - 验证成功:
+   ```bash
+   # 检查最终状态
+   grep "BG status: COMPLETED" /path/to/application.log
+
+   # 统计失败次数
+   grep "connection_error" /path/to/application.log | grep "$(date +%Y-%m-%d)" | wc -l
+
+   # 验证所有 worker 已恢复
+   grep "Retry 1/5" /path/to/application.log | wc -l
+   ```
+
+---
+
+## 文档修订历史
+
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 1.0 | 2025-12-09 | Aurora Blue-Green Lab | Initial runbook creation based on lab testing |
+
+---
+
+**如有问题或疑问，请参考:**
+- [AWS Advanced JDBC Wrapper Documentation](https://github.com/aws/aws-advanced-jdbc-wrapper)
+- [Aurora Blue-Green Deployments Guide](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/blue-green-deployments.html)
+- [Architecture Deep Dive](./aws-jdbc-wrapper-bluegreen-architecture.md)

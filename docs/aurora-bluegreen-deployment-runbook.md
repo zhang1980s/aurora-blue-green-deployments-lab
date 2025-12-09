@@ -147,7 +147,12 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
 ```
 
 **Key Parameters Checklist:**
-- ☐ `wrapperPlugins` contains `bg`
+- ☐ `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
+  - `initialConnection`: Establishes initial connection properties and validation
+  - `auroraConnectionTracker`: Tracks Aurora cluster topology and connection state
+  - `bg` (Blue-Green): Monitors Blue-Green deployment status for coordinated switchover
+  - `failover2`: Handles cluster-level failover scenarios (version 2)
+  - `efm2` (Enhanced Failure Monitoring v2): Proactive connection health monitoring
 - ☐ `bgdId=1` (or auto-detect)
 - ☐ `bgConnectTimeoutMs=30000`
 - ☐ `bgSwitchoverTimeoutMs=180000`
