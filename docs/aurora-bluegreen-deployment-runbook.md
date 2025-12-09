@@ -5,7 +5,7 @@
 **Document Version**: 1.0
 **Last Updated**: 2025-12-09
 **Author**: Aurora Blue-Green Deployment Lab Project
-**Based On**: Lab-verified testing with Aurora MySQL 3.04.4 → 3.10.2 across 2 clusters
+
 
 ---
 
@@ -32,7 +32,7 @@ This runbook provides step-by-step instructions for executing Aurora MySQL Blue-
 - **Downtime**: few seconds, depends on the real workload
 - **Success Rate**: 100% with automatic retry
 - **Failed Transactions**: 0 permanent failures
-- **Worker Impact**: Some workers experience transient errors during switchover, automatically recovered by JDBC wrapper retry mechanism (5 attempts, 500ms backoff). Applications with try-catch blocks will observe SQLException but should log and continue, not fail. See [Appendix D](#appendix-d-application-error-handling-with-try-catch-blocks) for detailed error handling guidance.
+- **Worker Impact**: Some workers experience transient errors during switchover, automatically recovered by JDBC wrapper retry mechanism (5 attempts, 500ms backoff). 
 
 ---
 
@@ -140,8 +140,10 @@ aws rds modify-db-cluster-parameter-group \
 
 **Verify JDBC URL includes Blue-Green plugin:**
 ```
-jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&connectTimeout=30000&socketTimeout=30000&failoverTimeoutMs=60000&failoverClusterTopologyRefreshRateMs=2000
+jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2
 ```
+
+**Note**: This example shows only the essential `wrapperPlugins` parameter. Keep any other existing JDBC parameters (e.g., `connectTimeout`, `socketTimeout`, etc.) in your actual connection string.
 
 **Key Parameters Checklist:**
 - ☐ `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
@@ -150,7 +152,7 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `bg` (Blue-Green): Monitors Blue-Green deployment status for coordinated switchover
   - `failover2`: Handles cluster-level failover scenarios (version 2)
   - `efm2` (Enhanced Failure Monitoring v2): Proactive connection health monitoring
-- ☐ `bgdId=1` (or auto-detect)
+
 
 #### ☐ 5. Logging Configuration (Testing/Staging)
 
@@ -714,270 +716,6 @@ grep -E "BG status:|Switched to new host|connection_error|SUCCESS.*Latency: [0-9
 
 ---
 
-## Appendix D: Application Error Handling with Try-Catch Blocks
-
-### Overview
-
-When applications have try-catch blocks around database operations, they **WILL observe** transient SQLException errors during Blue-Green switchover. However, the JDBC wrapper's automatic retry mechanism still works transparently, ensuring 100% success rate.
-
-### What Happens During Switchover
-
-```java
-try {
-    statement.execute(sql);
-    // Success path
-} catch (SQLException e) {
-    // Application WILL catch this error during switchover
-    logger.error("Database operation failed", e);
-    // Error message: "The active SQL connection has changed"
-}
-```
-
-**Expected Behavior:**
-- **55% of workers** will catch SQLException (11 out of 20 workers in lab tests)
-- **45% of workers** will not experience errors (immediate success)
-- **100% success rate** after automatic retry (no permanent failures)
-
-### Timeline of Error and Recovery
-
-```
-T+0ms:   Switchover begins (IN_PROGRESS phase)
-T+27ms:  Worker hits connection error
-         → SQLException thrown to application
-         → Application catch block executes
-         → Application logs the error
-T+527ms: JDBC wrapper automatically retries (500ms backoff)
-         → Retry succeeds on Green cluster
-         → Next operation returns to normal latency
-```
-
-### Recommended Application Code Patterns
-
-#### Pattern 1: Log-and-Continue (✅ Recommended)
-
-```java
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-public class DatabaseService {
-    private static final Logger logger = LoggerFactory.getLogger(DatabaseService.class);
-
-    public void executeOperation(Statement statement, String sql) {
-        try {
-            statement.execute(sql);
-            logger.debug("Operation succeeded");
-
-        } catch (SQLException e) {
-            // Log for monitoring but DON'T fail the operation
-            logger.warn("Database operation encountered transient error: {}",
-                e.getMessage());
-
-            // Increment metrics counter
-            metrics.incrementCounter("database.transient_errors");
-
-            // JDBC wrapper will retry automatically (5 attempts, 500ms backoff)
-            // No action needed - the retry is transparent
-
-            // Optional: Small delay before next operation
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-}
-```
-
-**Why this works:**
-- Application observes the error (for alerting/monitoring)
-- But doesn't fail the transaction
-- JDBC wrapper retry handles recovery automatically
-- Next operation succeeds after wrapper reconnects
-
-#### Pattern 2: Application-Level Retry (⚠️ Not Recommended)
-
-```java
-public void executeWithRetry(Statement statement, String sql) {
-    int maxRetries = 3;
-    for (int i = 0; i < maxRetries; i++) {
-        try {
-            statement.execute(sql);
-            return; // Success
-        } catch (SQLException e) {
-            if (i == maxRetries - 1) {
-                throw new DatabaseException("Failed after retries", e);
-            }
-            logger.warn("Retry {}/{}: {}", i+1, maxRetries, e.getMessage());
-            Thread.sleep(500);
-        }
-    }
-}
-```
-
-**Why this is unnecessary:**
-- JDBC wrapper already retries (5 attempts, 500ms backoff)
-- Adds duplicate retry logic
-- Can cause longer delays than necessary
-- Increases code complexity
-
-#### Pattern 3: Fail-Fast (❌ Not Recommended for Blue-Green)
-
-```java
-public void executeWithFailFast(Statement statement, String sql) {
-    try {
-        statement.execute(sql);
-    } catch (SQLException e) {
-        logger.error("Database operation failed", e);
-        throw new DatabaseException("Operation failed", e);
-    }
-}
-```
-
-**Why this fails:**
-- Application terminates the operation permanently
-- JDBC wrapper retry still happens, but application already failed
-- Results in unnecessary failures during switchover
-- Violates Blue-Green zero-downtime objective
-
-### Required Configuration
-
-Based on WorkloadSimulator.java lab testing:
-
-```java
-// HikariCP Connection Pool Configuration
-HikariConfig hikariConfig = new HikariConfig();
-hikariConfig.setConnectionTimeout(30000);      // 30 seconds
-hikariConfig.setIdleTimeout(600000);           // 10 minutes
-hikariConfig.setMaxLifetime(1800000);          // 30 minutes
-hikariConfig.setMaximumPoolSize(100);          // 10 connections per worker
-hikariConfig.setMinimumIdle(10);
-
-// JDBC URL with Blue-Green Plugin
-String jdbcUrl = "jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/lab_db?" +
-    "wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&" +
-    "connectTimeout=30000&" +          // TCP connection timeout
-    "socketTimeout=30000&" +           // Socket read timeout
-    "failoverTimeoutMs=60000&" +       // Failover completion timeout
-    "bgConnectTimeoutMs=30000&" +      // BG switchover connection timeout
-    "bgSwitchoverTimeoutMs=180000";    // BG switchover process timeout (3 min)
-
-hikariConfig.setJdbcUrl(jdbcUrl);
-```
-
-### Expected Metrics During Switchover
-
-From lab testing (Test 055308 and 070455):
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Pure Downtime** | 27-29ms | Connection unavailability window |
-| **Workers Catching Errors** | 55% (11 of 20) | Will execute catch block |
-| **Workers Unaffected** | 45% (9 of 20) | No SQLException observed |
-| **Retry Success Rate** | 100% | All retries succeed on Green cluster |
-| **First Operation Latency** | 2,000-2,100ms | First operation after switchover |
-| **Normal Latency** | 2-4ms (writes)<br>0.3-0.7ms (reads) | Returns to baseline after first operation |
-| **JDBC Wrapper Retries** | 5 attempts | 500ms backoff between attempts |
-
-### Production Deployment Checklist
-
-**✅ DO:**
-- Log SQLException for monitoring (warn/info level)
-- Track transient error count in metrics
-- Trust JDBC wrapper's automatic retry mechanism
-- Configure connection pool timeouts ≥ 30 seconds
-- Monitor latency spikes (expect 2+ seconds for first operation)
-- Set up alerts for sustained errors (> 1 minute)
-
-**❌ DON'T:**
-- Throw exceptions that terminate the application
-- Implement redundant application-level retry logic
-- Use short timeout values (< 15 seconds)
-- Fail operations on first SQLException
-- Disable JDBC wrapper retry mechanism
-
-### Monitoring and Alerting
-
-**Metrics to Track:**
-```java
-// Count transient errors
-metrics.incrementCounter("database.transient_errors",
-    Tags.of("error_type", "connection_changed"));
-
-// Track latency spikes
-metrics.timer("database.operation_latency").record(duration);
-
-// Alert thresholds
-if (transientErrorRate > 100 errors/min for > 2 minutes) {
-    alert("Sustained database connectivity issues");
-}
-```
-
-**Expected During Switchover:**
-- **11-20 transient errors** for 20-worker configuration
-- **2+ second latency** for first operations
-- **Recovery within 500ms** for all workers
-- **Return to baseline** within 10-15 minutes (reads may take longer)
-
-### Example Production Code
-
-Complete example with all best practices:
-
-```java
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import io.micrometer.core.instrument.MeterRegistry;
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.sql.Statement;
-
-public class ProductionDatabaseService {
-    private static final Logger logger = LoggerFactory.getLogger(ProductionDatabaseService.class);
-    private final MeterRegistry metrics;
-
-    public ProductionDatabaseService(MeterRegistry metrics) {
-        this.metrics = metrics;
-    }
-
-    public void executeOperation(Connection connection, String sql) {
-        long startTime = System.nanoTime();
-
-        try (Statement statement = connection.createStatement()) {
-            statement.execute(sql);
-
-            // Track success
-            long duration = System.nanoTime() - startTime;
-            metrics.timer("database.operation.success")
-                .record(duration, TimeUnit.NANOSECONDS);
-
-            logger.debug("Operation succeeded in {}ms", duration / 1_000_000);
-
-        } catch (SQLException e) {
-            // Log transient error for monitoring
-            logger.warn("Database operation encountered transient error (JDBC wrapper will retry): {} - {}",
-                e.getSQLState(), e.getMessage());
-
-            // Track transient error for alerting
-            metrics.counter("database.transient_errors",
-                "error_code", e.getSQLState(),
-                "error_type", "connection_changed").increment();
-
-            // DO NOT throw - let JDBC wrapper retry mechanism handle it
-            // The wrapper will retry up to 5 times with 500ms backoff
-
-            // Optional: Brief delay before next operation
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-}
-```
-
-
----
 
 ## Document Revision History
 
