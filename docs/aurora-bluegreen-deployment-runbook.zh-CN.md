@@ -192,7 +192,7 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 在继续 Blue-Green 部署之前，验证以下最佳实践:
 
 **连接策略:**
--  对所有连接使用集群端点、读取器端点或自定义端点
+-  所有连接使用集群端点、读取器端点或自定义端点
 -  不要使用实例端点
 -  不要使用带有静态或排除列表的自定义端点
 -  确保无缝切换，无需更改连接字符串

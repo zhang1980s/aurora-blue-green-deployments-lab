@@ -38,7 +38,7 @@ This runbook provides step-by-step instructions for executing Aurora MySQL Blue-
 
 ### Prerequisites Verification
 
-#### ☐ 0. AWS Advanced JDBC Wrapper Version
+####  0. AWS Advanced JDBC Wrapper Version
 
 **Requirement**: Application must use AWS Advanced JDBC Wrapper **version 2.6.8 or later**.
 
@@ -66,7 +66,7 @@ grep -A 2 "aws-advanced-jdbc-wrapper" pom.xml
 
 **Lab-Tested Version**: 2.6.8
 
-#### ☐ 1. Database User Permissions
+####  1. Database User Permissions
 
 **Verify permissions on both Blue and Green clusters:**
 ```sql
@@ -92,7 +92,7 @@ SET DEFAULT ROLE 'bluegreen_reader' TO 'your_app_user'@'%';
 FLUSH PRIVILEGES;
 ```
 
-#### ☐ 2. Binary Logging Configuration
+####  2. Binary Logging Configuration
 
 **Check binary logging status:**
 ```sql
@@ -114,7 +114,7 @@ aws rds describe-db-clusters \
   --query 'DBClusters[0].DBClusterParameterGroup'
 ```
 
-#### ☐ 3. Multithreaded Replication (Recommended)
+####  3. Multithreaded Replication (Recommended)
 
 **Check current setting:**
 ```sql
@@ -134,7 +134,7 @@ aws rds modify-db-cluster-parameter-group \
   --parameters "ParameterName=replica_parallel_workers,ParameterValue=4,ApplyMethod=immediate"
 ```
 
-#### ☐ 4. Application Configuration
+####  4. Application Configuration
 
 **Verify JDBC URL includes Blue-Green plugin:**
 ```
@@ -144,7 +144,7 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
 **Note**: This example shows only the essential `wrapperPlugins` parameter. Keep any other existing JDBC parameters (e.g., `connectTimeout`, `socketTimeout`, etc.) in your actual connection string.
 
 **Key Parameters Checklist:**
-- ☐ `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
+-  `wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2`
   - `initialConnection`: Establishes initial connection properties and validation
   - `auroraConnectionTracker`: Tracks Aurora cluster topology and connection state
   - `bg` (Blue-Green): Monitors Blue-Green deployment status for coordinated switchover
@@ -152,7 +152,7 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
   - `efm2` (Enhanced Failure Monitoring v2): Proactive connection health monitoring
 
 
-#### ☐ 5. Logging Configuration (Testing/Staging)
+####  5. Logging Configuration (Testing/Staging)
 
 **Enable debug logging for Blue-Green plugin:**
 
@@ -174,7 +174,7 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 </Logger>
 ```
 
-#### ☐ 6. Monitoring Setup
+####  6. Monitoring Setup
 
 **CloudWatch Metrics to Monitor:**
 - `DatabaseConnections` (current connections)
@@ -187,26 +187,26 @@ java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setL
 - Transaction success/failure rate
 - P50, P95, P99 latency
 
-#### ☐ 7. General Best Practices Verification
+####  7. General Best Practices Verification
 
 Before proceeding with Blue-Green deployment, verify the following best practices:
 
 **Connection Strategy:**
-- ☐ Use cluster endpoint, reader endpoint, or custom endpoint for all connections
-- ☐ Do NOT use instance endpoints
-- ☐ Do NOT use custom endpoints with static or exclusion lists
-- ☐ Ensures seamless switchover without connection string changes
+-  Use cluster endpoint, reader endpoint, or custom endpoint for all connections
+-  Do NOT use instance endpoints
+-  Do NOT use custom endpoints with static or exclusion lists
+-  Ensures seamless switchover without connection string changes
 
 **Green Environment Usage:**
-- ☐ Keep green environment read-only until switchover
-- ☐ Enable write operations with caution (can cause replication conflicts)
-- ☐ Avoid unintended data that could become production data after switchover
+-  Keep green environment read-only until switchover
+-  Enable write operations with caution (can cause replication conflicts)
+-  Avoid unintended data that could become production data after switchover
 
 **Schema Change Compatibility:**
-- ☐ Make only replication-compatible schema changes
-- ☐ **Compatible**: Adding new columns at the end of a table
-- ☐ **Incompatible**: Renaming columns or tables (breaks replication)
-- ☐ Reference: [MySQL Replication with Differing Table Definitions](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
+-  Make only replication-compatible schema changes
+-  **Compatible**: Adding new columns at the end of a table
+-  **Incompatible**: Renaming columns or tables (breaks replication)
+-  Reference: [MySQL Replication with Differing Table Definitions](https://dev.mysql.com/doc/refman/8.0/en/replication-features-differing-tables.html)
 
 ---
 
@@ -310,10 +310,10 @@ aws cloudwatch get-metric-statistics \
 ```
 
 **Green Cluster Ready When:**
-- ☐ Status = `AVAILABLE`
-- ☐ Replication lag < 1 second
-- ☐ Green cluster endpoint accessible
-- ☐ Application logs show: `[bgdId: '1'] BG status: CREATED`
+-  Status = `AVAILABLE`
+-  Replication lag < 1 second
+-  Green cluster endpoint accessible
+-  Application logs show: `[bgdId: '1'] BG status: CREATED`
 
 #### Action 3.4: Manage Replica Lag (If Applicable)
 
@@ -368,10 +368,10 @@ aws rds modify-db-parameter-group \
 ```
 
 **Health Checks:**
-- ☐ Application logs show no connection errors
-- ☐ Connection pool utilization < 80%
-- ☐ Transaction success rate > 99.9%
-- ☐ No manual transactions in progress
+-  Application logs show no connection errors
+-  Connection pool utilization < 80%
+-  Transaction success rate > 99.9%
+-  No manual transactions in progress
 
 #### Action 4.2: Verify Deployment Status
 ```bash
@@ -433,10 +433,10 @@ T+55s:  COMPLETED phase
 #### Action 5.3: Observe Worker Behavior
 
 **Monitor for expected patterns:**
-- ☐ Errors contain: "The active SQL connection has changed"
-- ☐ Workers automatically retry within 500ms
-- ☐ All workers successfully reconnect to new host
-- ☐ First operation after switchover: ~2-2.1 second latency (normal)
+-  Errors contain: "The active SQL connection has changed"
+-  Workers automatically retry within 500ms
+-  All workers successfully reconnect to new host
+-  First operation after switchover: ~2-2.1 second latency (normal)
 
 ---
 
@@ -457,10 +457,10 @@ SELECT @@aurora_version;
 
 #### Action 6.2: Check Application Health
 **Verify in application logs:**
-- ☐ All workers operational
-- ☐ No ongoing connection errors
-- ☐ Transaction success rate = 100%
-- ☐ New host confirmed: `ip-10-x-x-x` (different from old host)
+-  All workers operational
+-  No ongoing connection errors
+-  Transaction success rate = 100%
+-  New host confirmed: `ip-10-x-x-x` (different from old host)
 
 #### Action 6.3: Validate Deployment Status
 ```bash
@@ -534,21 +534,21 @@ SHOW REPLICA STATUS\G
 ### Deployment Success Checklist
 
 #### Technical Success Criteria
-- ☐ Pure downtime: few seconds
-- ☐ Permanent failed transactions: 0
-- ☐ Transaction success rate: 100% (after retry)
-- ☐ Aurora version upgraded: ✅ (verify with `SELECT @@aurora_version;`)
-- ☐ Write latency unchanged: ✅ (2-4ms baseline maintained)
-- ☐ All workers recovered: ✅
-- ☐ Blue-Green lifecycle completed: ✅ (NOT_CREATED → COMPLETED)
+-  Pure downtime: few seconds
+-  Permanent failed transactions: 0
+-  Transaction success rate: 100% (after retry)
+-  Aurora version upgraded: ✅ (verify with `SELECT @@aurora_version;`)
+-  Write latency unchanged: ✅ (2-4ms baseline maintained)
+-  All workers recovered: ✅
+-  Blue-Green lifecycle completed: ✅ (NOT_CREATED → COMPLETED)
 
 #### Operational Success Criteria
-- ☐ Zero manual intervention required
-- ☐ No application code changes needed
-- ☐ No customer-visible errors
-- ☐ No data loss or corruption
-- ☐ Monitoring dashboards show healthy state
-- ☐ Old Blue cluster ready for decommission
+-  Zero manual intervention required
+-  No application code changes needed
+-  No customer-visible errors
+-  No data loss or corruption
+-  Monitoring dashboards show healthy state
+-  Old Blue cluster ready for decommission
 
 ---
 
@@ -560,10 +560,10 @@ SHOW REPLICA STATUS\G
 
 #### Action 9.1: Final Validation
 **Verify Green cluster stability:**
-- ☐ 24+ hours of stable operation
-- ☐ No unexpected errors or degradation
-- ☐ Read latency returned to acceptable levels
-- ☐ All monitoring metrics healthy
+-  24+ hours of stable operation
+-  No unexpected errors or degradation
+-  Read latency returned to acceptable levels
+-  All monitoring metrics healthy
 
 #### Action 9.2: Delete Blue-Green Deployment
 ```bash
