@@ -38,8 +38,8 @@
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- AWS JDBC Wrapper logger - FINE level (via JUL bridge) shows Blue-Green plugin activity -->
-        <Logger name="software.amazon.jdbc" level="debug" additivity="false">
+        <!-- AWS JDBC Wrapper logger (via JUL bridge) -->
+        <Logger name="software.amazon.jdbc" level="info" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>

@@ -675,11 +675,10 @@ public class WorkloadSimulator {
         }
 
         // Configure JUL to SLF4J bridge for AWS JDBC Wrapper logging
-        // This allows us to see detailed Blue-Green plugin activity
+        // This allows us to see AWS JDBC Wrapper logs through SLF4J/Log4j2
         LogManager.getLogManager().reset();
         SLF4JBridgeHandler.removeHandlersForRootLogger();
         SLF4JBridgeHandler.install();
-        java.util.logging.Logger.getLogger("software.amazon.jdbc").setLevel(Level.FINE);
 
         // Start the simulator
         WorkloadSimulator simulator = new WorkloadSimulator(config);
