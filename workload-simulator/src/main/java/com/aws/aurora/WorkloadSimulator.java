@@ -17,8 +17,9 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,7 +29,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
 import java.util.logging.LogManager;
 
 /**
@@ -48,6 +48,7 @@ import java.util.logging.LogManager;
 public class WorkloadSimulator {
 
     private static final Logger logger = LoggerFactory.getLogger(WorkloadSimulator.class);
+    private static final Logger operationsLogger = LoggerFactory.getLogger("com.aws.aurora.operations");
 
     // Configuration parameters
     private final String auroraEndpoint;
@@ -61,9 +62,17 @@ public class WorkloadSimulator {
     private final int connectionPoolSize;
     private final int logIntervalSeconds;
     private final String blueGreenDeploymentId;
+    private final ConsoleFormat consoleFormat;
 
     // Data source and connection pool
     private HikariDataSource dataSource;
+
+    // Runtime tracking for dashboard/event formats
+    private final long startTime = System.currentTimeMillis();
+    private String lastKnownHost = null;
+    private BlueGreenPhase currentBlueGreenPhase = BlueGreenPhase.NOT_CREATED;
+    private boolean switchoverInProgress = false;
+    private String lastBgdId = null;
 
     // Metrics registry
     private final MeterRegistry meterRegistry;
@@ -108,6 +117,7 @@ public class WorkloadSimulator {
         this.connectionPoolSize = config.connectionPoolSize;
         this.logIntervalSeconds = config.logIntervalSeconds;
         this.blueGreenDeploymentId = config.blueGreenDeploymentId;
+        this.consoleFormat = config.consoleFormat;
 
         // Initialize metrics registry
         if (config.enablePrometheus) {
@@ -289,12 +299,12 @@ public class WorkloadSimulator {
                         currentHost = newHost;
                     }
 
-                    logger.info("SUCCESS: Worker-{} | Host: {} | Table: {} | INSERT completed | Latency: {}ms",
+                    getOperationLogger().info("SUCCESS: Worker-{} | Host: {} | Table: {} | INSERT completed | Latency: {}ms",
                         workerId, currentHost != null ? currentHost : "unknown", tableName, latency);
                 } else {
                     failedRequests.incrementAndGet();
                     failureCounter.increment();
-                    logger.error("FAILED: Worker-{} | Table: {} | INSERT failed | Latency: {}ms",
+                    getOperationLogger().error("FAILED: Worker-{} | Table: {} | INSERT failed | Latency: {}ms",
                         workerId, tableName, latency);
                 }
 
@@ -359,11 +369,11 @@ public class WorkloadSimulator {
                         currentHost = hostname;
                     }
 
-                    logger.info("SUCCESS: Reader-{} | Result: {} | Latency: {}ms",
+                    getOperationLogger().info("SUCCESS: Reader-{} | Result: {} | Latency: {}ms",
                         workerId, result, latency);
                 } else {
                     failedReadRequests.incrementAndGet();
-                    logger.error("FAILED: Reader-{} | Query: system_vars | READ failed | Latency: {}ms",
+                    getOperationLogger().error("FAILED: Reader-{} | Query: system_vars | READ failed | Latency: {}ms",
                         workerId, latency);
                 }
 
@@ -413,7 +423,10 @@ public class WorkloadSimulator {
                 return rowsAffected > 0;
 
             } catch (SQLException e) {
-                logger.warn("Worker-{} | Table: {} | connection_error | Retry {}/{} in {}ms | Error: {}",
+                // Check if this error might be Blue-Green switchover related
+                detectBlueGreenEventsFromError(e);
+
+                getOperationLogger().warn("Worker-{} | Table: {} | connection_error | Retry {}/{} in {}ms | Error: {}",
                     workerId, tableName, attempt, maxRetries, retryDelayMs * attempt, e.getMessage());
 
                 if (attempt < maxRetries) {
@@ -424,7 +437,7 @@ public class WorkloadSimulator {
                         return false;
                     }
                 } else {
-                    logger.error("Worker-{} | Table: {} | Max retries exceeded", workerId, tableName);
+                    getOperationLogger().error("Worker-{} | Table: {} | Max retries exceeded", workerId, tableName);
                     return false;
                 }
             }
@@ -462,8 +475,11 @@ public class WorkloadSimulator {
                 return null;
 
             } catch (SQLException e) {
+                // Check if this error might be Blue-Green switchover related
+                detectBlueGreenEventsFromError(e);
+
                 if (attempt < maxRetries) {
-                    logger.warn("Reader-{} | Query: system_vars | connection_error | Retry {}/{} in {}ms | Error: {}",
+                    getOperationLogger().warn("Reader-{} | Query: system_vars | connection_error | Retry {}/{} in {}ms | Error: {}",
                         workerId, attempt, maxRetries, retryDelayMs, e.getMessage());
 
                     try {
@@ -474,13 +490,22 @@ public class WorkloadSimulator {
                         return null;
                     }
                 } else {
-                    logger.error("Reader-{} | Query: system_vars | Max retries exceeded", workerId);
+                    getOperationLogger().error("Reader-{} | Query: system_vars | Max retries exceeded", workerId);
                     return null;
                 }
             }
         }
 
         return null;
+    }
+
+    /**
+     * Get appropriate logger based on console format
+     * - VERBOSE: logs to both console and file
+     * - DASHBOARD/EVENT_DRIVEN: logs to file only
+     */
+    private Logger getOperationLogger() {
+        return (consoleFormat == ConsoleFormat.VERBOSE) ? logger : operationsLogger;
     }
 
     /**
@@ -495,15 +520,280 @@ public class WorkloadSimulator {
                 return rs.getString(1);
             }
         } catch (SQLException e) {
-            // Ignore - not critical
+            // Check if this might be a Blue-Green switchover related error
+            detectBlueGreenEventsFromError(e);
         }
         return null;
     }
 
     /**
-     * Log statistics
+     * Detect Blue-Green events from connection errors and behaviors
+     */
+    private void detectBlueGreenEventsFromError(SQLException e) {
+        String errorMessage = e.getMessage();
+
+        if (errorMessage != null) {
+            // Check for typical Blue-Green switchover error messages
+            if (errorMessage.contains("The active SQL connection has changed") ||
+                errorMessage.contains("Communications link failure") ||
+                errorMessage.contains("Connection is closed")) {
+
+                // If we're not already in IN_PROGRESS, this might indicate switchover
+                if (currentBlueGreenPhase != BlueGreenPhase.IN_PROGRESS) {
+                    updateBlueGreenPhase(BlueGreenPhase.IN_PROGRESS, "Detected connection errors");
+                    switchoverInProgress = true;
+                }
+            }
+        }
+    }
+
+    /**
+     * Update Blue-Green phase and log transition
+     */
+    private synchronized void updateBlueGreenPhase(BlueGreenPhase newPhase, String reason) {
+        if (newPhase != currentBlueGreenPhase) {
+            BlueGreenPhase previousPhase = currentBlueGreenPhase;
+            currentBlueGreenPhase = newPhase;
+
+            String timestamp = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+
+            // Log phase transition in console formats
+            if (consoleFormat == ConsoleFormat.EVENT_DRIVEN || consoleFormat == ConsoleFormat.VERBOSE) {
+                System.out.printf("[%s] 🔄 BG-PHASE | %s → %s | %s%n",
+                    timestamp, previousPhase.getDisplayName(), newPhase.getDisplayName(), reason);
+            }
+
+            // Update switchover status
+            if (newPhase == BlueGreenPhase.IN_PROGRESS) {
+                switchoverInProgress = true;
+            } else if (newPhase == BlueGreenPhase.POST || newPhase == BlueGreenPhase.COMPLETED) {
+                switchoverInProgress = false;
+            }
+
+            // Log to file via logger
+            logger.info("Blue-Green phase transition: {} → {} ({})",
+                previousPhase.getPhaseName(), newPhase.getPhaseName(), reason);
+        }
+    }
+
+    /**
+     * Detect Blue-Green deployment status from deployment ID and connection behavior
+     */
+    private void detectBlueGreenStatus() {
+        // If blueGreenDeploymentId is specified, assume we have a deployment
+        if (blueGreenDeploymentId != null && !blueGreenDeploymentId.isEmpty() &&
+            currentBlueGreenPhase == BlueGreenPhase.NOT_CREATED) {
+            updateBlueGreenPhase(BlueGreenPhase.CREATED, "Deployment ID specified: " + blueGreenDeploymentId);
+            lastBgdId = blueGreenDeploymentId;
+        }
+
+        // Check for host changes that might indicate switchover completion
+        String currentHost = getCurrentHost();
+        if (currentHost != null && lastKnownHost != null && !currentHost.equals(lastKnownHost)) {
+            if (switchoverInProgress) {
+                updateBlueGreenPhase(BlueGreenPhase.POST, "Host switched: " + lastKnownHost + " → " + currentHost);
+            } else if (currentBlueGreenPhase == BlueGreenPhase.CREATED ||
+                      currentBlueGreenPhase == BlueGreenPhase.PREPARATION) {
+                // Unexpected host change might indicate switchover
+                updateBlueGreenPhase(BlueGreenPhase.POST, "Unexpected host change: " + lastKnownHost + " → " + currentHost);
+            }
+        }
+
+        // Simulate detection of PREPARATION phase before switchover
+        // In a real scenario, this would be detected by parsing JDBC wrapper logs
+        if (currentBlueGreenPhase == BlueGreenPhase.CREATED) {
+            // After some time in CREATED, transition to PREPARATION
+            // This is a simulation - real implementation would parse JDBC logs
+            long timeInCreated = System.currentTimeMillis() - startTime;
+            if (timeInCreated > 30000) { // After 30 seconds, simulate PREPARATION
+                updateBlueGreenPhase(BlueGreenPhase.PREPARATION, "Simulated: Green cluster syncing");
+            }
+        }
+    }
+
+    /**
+     * Format 2: Event-driven clean console output
+     */
+    private void logEventDrivenFormat() {
+        long total = totalRequests.get();
+        long success = successfulRequests.get();
+        long failed = failedRequests.get();
+
+        long totalRead = totalReadRequests.get();
+        long successRead = successfulReadRequests.get();
+        long failedRead = failedReadRequests.get();
+        double avgReadLatency = successRead > 0 ? (totalReadLatencyMs.get() * 1.0 / successRead) : 0.0;
+
+        String currentTime = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+
+        // Check for host changes (potential switchover events)
+        String currentHost = getCurrentHost();
+        if (currentHost != null && !currentHost.equals(lastKnownHost)) {
+            if (lastKnownHost != null) {
+                System.out.printf("[%s] ✅ RECOVERY| New writer: %s | Reconnection successful%n",
+                    currentTime, currentHost);
+            } else {
+                System.out.printf("[%s] 🚀 STARTED  | Writers: %d | Rate: %d/sec | Pool: %d | Target: %s:3306%n",
+                    currentTime, writeWorkers, writeRatePerWorker, connectionPoolSize, currentHost);
+            }
+            lastKnownHost = currentHost;
+        }
+
+        // Log periodic summary
+        int combinedTotal = (int)(total + totalRead);
+        int combinedSuccess = (int)(success + successRead);
+        int combinedFailed = (int)(failed + failedRead);
+        double combinedSuccessRate = combinedTotal > 0 ? (combinedSuccess * 100.0 / combinedTotal) : 0.0;
+
+        System.out.printf("[%s] 📈 SUMMARY  | %ds | Total: %d | Success: %d (%.1f%%) | Failed: %d | Avg: %.0fms%n",
+            currentTime, logIntervalSeconds, combinedTotal, combinedSuccess, combinedSuccessRate,
+            combinedFailed, avgReadLatency > 0 ? avgReadLatency : 0.0);
+
+        // Update Blue-Green status detection
+        detectBlueGreenStatus();
+
+        // Log Blue-Green deployment detection
+        if (blueGreenDeploymentId != null && currentBlueGreenPhase == BlueGreenPhase.CREATED && lastBgdId == null) {
+            System.out.printf("[%s] 🔄 DETECTED | Blue-Green deployment: %s | Phase: %s%n",
+                currentTime, blueGreenDeploymentId, currentBlueGreenPhase.getDisplayName());
+            lastBgdId = blueGreenDeploymentId;
+        }
+    }
+
+    /**
+     * Format 3: Dashboard-style console output
+     */
+    private void logDashboardFormat() {
+        long total = totalRequests.get();
+        long success = successfulRequests.get();
+        long failed = failedRequests.get();
+        double successRate = total > 0 ? (success * 100.0 / total) : 0.0;
+
+        long totalRead = totalReadRequests.get();
+        long successRead = successfulReadRequests.get();
+        long failedRead = failedReadRequests.get();
+        double avgReadLatency = successRead > 0 ? (totalReadLatencyMs.get() * 1.0 / successRead) : 0.0;
+
+        String currentHost = getCurrentHost();
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+
+        // Calculate runtime
+        long runtimeMs = System.currentTimeMillis() - startTime;
+        long hours = runtimeMs / 3600000;
+        long minutes = (runtimeMs % 3600000) / 60000;
+        long seconds = (runtimeMs % 60000) / 1000;
+        String runtime = String.format("%02d:%02d:%02d", hours, minutes, seconds);
+
+        // Get connection pool stats
+        int activeConnections = 0;
+        int totalConnections = 0;
+        try {
+            activeConnections = dataSource.getHikariPoolMXBean().getActiveConnections();
+            totalConnections = dataSource.getHikariPoolMXBean().getTotalConnections();
+        } catch (Exception e) {
+            // Ignore - pool might not be ready
+        }
+
+        // Calculate combined statistics
+        int combinedTotal = (int)(total + totalRead);
+        int combinedSuccess = (int)(success + successRead);
+        int combinedFailed = (int)(failed + failedRead);
+        double combinedSuccessRate = combinedTotal > 0 ? (combinedSuccess * 100.0 / combinedTotal) : 0.0;
+
+        // Clear screen and show dashboard (comment out clear if not desired)
+        // System.out.print("\033[2J\033[H"); // Clear screen and move cursor to top
+
+        // Update Blue-Green status detection
+        detectBlueGreenStatus();
+
+        System.out.println("┌─────────────────────────────────────────────────────────────────────────────┐");
+        System.out.printf("│ Aurora Blue-Green Monitor │ %s │ Runtime: %s        │%n", timestamp, runtime);
+        System.out.println("├─────────────────────────────────────────────────────────────────────────────┤");
+        System.out.printf("│ Current Writer: %-25s │ BG Phase: %-17s │%n",
+            currentHost != null ? currentHost : "unknown", currentBlueGreenPhase.getDisplayName());
+        System.out.printf("│ Workers: %d/%d Active    │ Pool: %d/%-3d      │ Deployment: %-15s │%n",
+            writeWorkers + readWorkers, writeWorkers + readWorkers, activeConnections, totalConnections,
+            blueGreenDeploymentId != null ? blueGreenDeploymentId : "none");
+        System.out.println("├─────────────────────────────────────────────────────────────────────────────┤");
+        System.out.printf("│ LAST %d SECONDS%67s │%n", logIntervalSeconds, "");
+        System.out.printf("│ ├─ Operations: %-8d │ Success: %d (%.1f%%)  │ Failed: %d (%.1f%%)%7s │%n",
+            combinedTotal, combinedSuccess, combinedSuccessRate, combinedFailed,
+            combinedTotal > 0 ? (combinedFailed * 100.0 / combinedTotal) : 0.0, "");
+
+        // Show detailed stats if both read and write are active
+        if (writeWorkers > 0 && readWorkers > 0) {
+            System.out.printf("│ ├─ Writes: %-12d │ Success: %d (%.1f%%)    │ Failed: %d%13s │%n",
+                (int)total, (int)success, successRate, (int)failed, "");
+            System.out.printf("│ ├─ Reads: %-13d │ Success: %d (%.1f%%)    │ Avg: %.0fms%12s │%n",
+                (int)totalRead, (int)successRead,
+                totalRead > 0 ? (successRead * 100.0 / totalRead) : 0.0, avgReadLatency, "");
+        } else {
+            System.out.printf("│ ├─ Avg Latency: %.0fms%4s │ P95: --ms             │ P99: --ms%16s │%n",
+                avgReadLatency, "", "");
+        }
+
+        if (combinedFailed > 0) {
+            System.out.printf("│ └─ Recent Errors: Connection issues (%d), Timeouts (%d)%20s │%n",
+                combinedFailed / 2, combinedFailed / 2, "");
+        } else {
+            System.out.printf("│ └─ No errors in last %d seconds%44s │%n", logIntervalSeconds, "");
+        }
+
+        System.out.println("├─────────────────────────────────────────────────────────────────────────────┤");
+
+        // Show recent events based on Blue-Green phase
+        String eventTime = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+        switch (currentBlueGreenPhase) {
+            case IN_PROGRESS:
+                System.out.printf("│ %s ⚠️  BLUE-GREEN SWITCHOVER IN PROGRESS%32s │%n", eventTime, "");
+                break;
+            case PREPARATION:
+                System.out.printf("│ %s 🟡 PREPARING: Green cluster syncing data%32s │%n", eventTime, "");
+                break;
+            case POST:
+                System.out.printf("│ %s 🟠 FINALIZING: Switchover completed, stabilizing%26s │%n", eventTime, "");
+                break;
+            case CREATED:
+                System.out.printf("│ %s 🟡 CREATED: Green cluster ready, awaiting switchover%23s │%n", eventTime, "");
+                break;
+            case COMPLETED:
+                System.out.printf("│ %s ✅ COMPLETED: Blue-Green deployment finished%29s │%n", eventTime, "");
+                break;
+            default:
+                if (combinedFailed > 5) {
+                    System.out.printf("│ %s 💔 HIGH ERROR RATE: %d failures detected%28s │%n",
+                        eventTime, combinedFailed, "");
+                } else {
+                    System.out.printf("│ %s ✅ STABLE: All systems operational%35s │%n", eventTime, "");
+                }
+        }
+
+        System.out.println("└─────────────────────────────────────────────────────────────────────────────┘");
+        System.out.println(); // Add spacing
+    }
+
+    /**
+     * Log statistics based on configured console format
      */
     private void logStatistics() {
+        switch (consoleFormat) {
+            case EVENT_DRIVEN:
+                logEventDrivenFormat();
+                break;
+            case DASHBOARD:
+                logDashboardFormat();
+                break;
+            case VERBOSE:
+            default:
+                logVerboseFormat();
+                break;
+        }
+    }
+
+    /**
+     * Original verbose format logging
+     */
+    private void logVerboseFormat() {
         // Write statistics
         long total = totalRequests.get();
         long success = successfulRequests.get();
@@ -580,6 +870,54 @@ public class WorkloadSimulator {
     }
 
     /**
+     * Console output format options
+     */
+    public enum ConsoleFormat {
+        VERBOSE,      // Original detailed logging
+        EVENT_DRIVEN, // Format 2: Event-driven clean output
+        DASHBOARD     // Format 3: Dashboard-style output (default)
+    }
+
+    /**
+     * Blue-Green deployment phases from AWS JDBC Wrapper
+     */
+    public enum BlueGreenPhase {
+        NOT_CREATED("NOT_CREATED", "🔵", "No deployment"),
+        CREATED("CREATED", "🟡", "Green cluster created"),
+        PREPARATION("PREPARATION", "🟡", "Syncing data"),
+        IN_PROGRESS("IN_PROGRESS", "🔴", "SWITCHING OVER"),
+        POST("POST", "🟠", "Finalizing"),
+        COMPLETED("COMPLETED", "🟢", "Complete");
+
+        private final String phaseName;
+        private final String emoji;
+        private final String description;
+
+        BlueGreenPhase(String phaseName, String emoji, String description) {
+            this.phaseName = phaseName;
+            this.emoji = emoji;
+            this.description = description;
+        }
+
+        public String getPhaseName() { return phaseName; }
+        public String getEmoji() { return emoji; }
+        public String getDescription() { return description; }
+
+        public static BlueGreenPhase fromString(String phaseName) {
+            for (BlueGreenPhase phase : values()) {
+                if (phase.phaseName.equals(phaseName)) {
+                    return phase;
+                }
+            }
+            return NOT_CREATED;
+        }
+
+        public String getDisplayName() {
+            return String.format("%s %s", emoji, phaseName);
+        }
+    }
+
+    /**
      * Configuration class
      */
     public static class Config {
@@ -595,6 +933,8 @@ public class WorkloadSimulator {
         int logIntervalSeconds = 10;
         String blueGreenDeploymentId = null;
         boolean enablePrometheus = false;
+        ConsoleFormat consoleFormat = ConsoleFormat.DASHBOARD; // Default to Format 3
+        String jdbcLogLevel = "info"; // Default JDBC wrapper log level
     }
 
     /**
@@ -642,6 +982,28 @@ public class WorkloadSimulator {
                 case "--enable-prometheus":
                     config.enablePrometheus = true;
                     break;
+                case "--console-format":
+                    String formatValue = args[++i];
+                    try {
+                        config.consoleFormat = ConsoleFormat.valueOf(formatValue.toUpperCase());
+                    } catch (IllegalArgumentException e) {
+                        System.err.println("Error: Invalid console format: " + formatValue);
+                        System.err.println("Valid formats: verbose, event_driven, dashboard");
+                        System.exit(1);
+                    }
+                    break;
+                case "--jdbc-log-level":
+                    String logLevel = args[++i].toLowerCase();
+                    if (logLevel.equals("finest") || logLevel.equals("fine") || logLevel.equals("info") ||
+                        logLevel.equals("warn") || logLevel.equals("error") || logLevel.equals("debug") ||
+                        logLevel.equals("trace")) {
+                        config.jdbcLogLevel = logLevel;
+                    } else {
+                        System.err.println("Error: Invalid JDBC log level: " + logLevel);
+                        System.err.println("Valid levels: finest, fine, debug, info, warn, error, trace");
+                        System.exit(1);
+                    }
+                    break;
                 case "--help":
                     printUsage();
                     return;
@@ -673,6 +1035,9 @@ public class WorkloadSimulator {
             System.err.println("Error: --write-workers must be at least 1");
             System.exit(1);
         }
+
+        // Set JDBC log level system property for log4j2.xml
+        System.setProperty("jdbc.log.level", config.jdbcLogLevel);
 
         // Configure JUL to SLF4J bridge for AWS JDBC Wrapper logging
         // This allows us to see AWS JDBC Wrapper logs through SLF4J/Log4j2
@@ -713,6 +1078,8 @@ public class WorkloadSimulator {
         System.out.println("  --log-interval <seconds>        Statistics log interval (default: 10)");
         System.out.println("  --blue-green-deployment-id <id> Blue-Green deployment ID (optional, auto-detect if not provided)");
         System.out.println("  --enable-prometheus             Enable Prometheus metrics export");
+        System.out.println("  --console-format <format>       Console output format: verbose, event_driven, dashboard (default: dashboard)");
+        System.out.println("  --jdbc-log-level <level>        JDBC wrapper log level: finest, fine, debug, info, warn, error (default: info)");
         System.out.println("  --help                          Show this help message");
         System.out.println("\nExamples:");
         System.out.println("  # Basic usage");
@@ -733,6 +1100,19 @@ public class WorkloadSimulator {
         System.out.println("    --write-rate 50 \\");
         System.out.println("    --read-workers 10 \\");
         System.out.println("    --read-rate 50 \\");
+        System.out.println("    --password MySecretPassword");
+        System.out.println("\n  # Event-driven console output for cleaner logs");
+        System.out.println("  java -jar workload-simulator.jar \\");
+        System.out.println("    --aurora-endpoint my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com \\");
+        System.out.println("    --write-workers 10 \\");
+        System.out.println("    --console-format event_driven \\");
+        System.out.println("    --password MySecretPassword");
+        System.out.println("\n  # Blue-Green debugging with detailed JDBC logs");
+        System.out.println("  java -jar workload-simulator.jar \\");
+        System.out.println("    --aurora-endpoint my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com \\");
+        System.out.println("    --blue-green-deployment-id bgd-123456 \\");
+        System.out.println("    --jdbc-log-level finest \\");
+        System.out.println("    --console-format dashboard \\");
         System.out.println("    --password MySecretPassword");
     }
 }

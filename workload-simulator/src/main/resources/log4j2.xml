@@ -26,26 +26,49 @@
     </Appenders>
 
     <Loggers>
-        <!-- Application logger -->
-        <Logger name="com.aws.aurora" level="info" additivity="false">
+        <!-- Application logger with dynamic level control -->
+        <Logger name="com.aws.aurora" level="${sys:LOG_LEVEL:-info}" additivity="false">
             <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Operations logger - file only (for dashboard/event_driven formats) -->
+        <Logger name="com.aws.aurora.operations" level="${sys:LOG_LEVEL:-info}" additivity="false">
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
         <!-- HikariCP connection pool logger -->
-        <Logger name="com.zaxxer.hikari" level="info" additivity="false">
+        <Logger name="com.zaxxer.hikari" level="${sys:hikari.log.level:-${sys:LOG_LEVEL:-info}}" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- AWS JDBC Wrapper logger (via JUL bridge) -->
-        <Logger name="software.amazon.jdbc" level="info" additivity="false">
+        <!-- AWS JDBC Wrapper logger (via JUL bridge) with dynamic level control -->
+        <Logger name="software.amazon.jdbc" level="${sys:jdbc.log.level:-info}" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- Root logger -->
-        <Root level="info">
+        <!-- Blue-Green plugin specific (most detailed) -->
+        <Logger name="software.amazon.jdbc.plugin.bluegreen" level="${sys:jdbc.bluegreen.log.level:-${sys:jdbc.log.level:-info}}" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Failover plugin specific -->
+        <Logger name="software.amazon.jdbc.plugin.failover2" level="${sys:jdbc.failover.log.level:-${sys:jdbc.log.level:-info}}" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Enhanced Failure Monitoring plugin -->
+        <Logger name="software.amazon.jdbc.plugin.efm2" level="${sys:jdbc.efm.log.level:-${sys:jdbc.log.level:-info}}" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Root logger with dynamic level control -->
+        <Root level="${sys:LOG_LEVEL:-info}">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Root>
