@@ -156,22 +156,89 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
 
 **Enable debug logging for Blue-Green plugin:**
 
-**Option 1: Configure in JDBC URL**
+The AWS JDBC Wrapper uses **Java Util Logging (JUL)** internally. The recommended approach is to control log levels via the `wrapperLoggerLevel` JDBC URL parameter.
+
+**Recommended: Configure via JDBC URL (Single Control Point)**
 ```
 jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&wrapperLoggerLevel=FINE
 ```
 
-**Option 2: Java application code**
+**Workload Simulator CLI Option:**
+```bash
+java -jar workload-simulator.jar \
+  --aurora-endpoint <cluster-endpoint> \
+  --jdbc-log-level FINE \
+  --password <password>
+```
+
+**JUL Log Level Reference:**
+
+| Level | Verbosity | When to Use |
+|-------|-----------|-------------|
+| `SEVERE` | Lowest | Only errors and critical failures |
+| `WARNING` | Low | Warnings and errors |
+| `INFO` | Normal | Normal operational messages (default) |
+| `CONFIG` | Medium | Configuration information |
+| `FINE` | High | Debug-level diagnostic information |
+| `FINER` | Higher | More detailed tracing |
+| `FINEST` | Highest | Maximum verbosity - all internal operations |
+| `OFF` | None | Disable all JDBC wrapper logging |
+| `ALL` | Everything | Enable all log levels |
+
+**Logging Architecture (Workload Simulator):**
+```
+CLI: --jdbc-log-level FINE
+        ↓
+JDBC URL: wrapperLoggerLevel=FINE  ← SINGLE CONTROL POINT
+        ↓
+AWS JDBC Wrapper (JUL) filters logs at source
+        ↓
+SLF4JBridgeHandler forwards to SLF4J
+        ↓
+Log4j2 passes through to Console + RollingFile (level="all")
+```
+
+**Why URL-based control?**
+- **Single control point** - No confusion about which filter is active
+- **Simple** - One parameter controls everything
+- **Predictable** - Log level set at JDBC wrapper source
+- **Standard** - Uses AWS JDBC Wrapper's native parameter
+
+**Alternative: Java application code**
 ```java
 // Java application - add to startup code
 java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setLevel(Level.FINE);
 ```
 
-**Option 3: Log4j2 Configuration**
+**Alternative: Log4j2 Configuration (pass-through mode)**
 ```xml
-<Logger name="software.amazon.jdbc.plugin.bluegreen" level="FINE" additivity="false">
+<!-- Set level="all" to pass through - filtering done by wrapperLoggerLevel -->
+<Logger name="software.amazon.jdbc" level="all" additivity="false">
   <AppenderRef ref="Console"/>
+  <AppenderRef ref="RollingFile"/>
 </Logger>
+```
+
+**JUL to SLF4J Bridge (for SLF4J/Log4j2 applications)**
+
+The AWS JDBC Wrapper uses **Java Util Logging (JUL)** internally, but applications often use **SLF4J/Log4j2**. The bridge connects them:
+
+```java
+// In application main() - before creating connections
+LogManager.getLogManager().reset();
+SLF4JBridgeHandler.removeHandlersForRootLogger();
+SLF4JBridgeHandler.install();
+```
+
+This redirects all JUL logs from `software.amazon.jdbc.*` to SLF4J, which then routes them to Log4j2.
+
+**Maven Dependency:**
+```xml
+<dependency>
+  <groupId>org.slf4j</groupId>
+  <artifactId>jul-to-slf4j</artifactId>
+  <version>2.0.16</version>
+</dependency>
 ```
 
 ####  6. Monitoring Setup

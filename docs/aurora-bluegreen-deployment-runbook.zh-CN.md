@@ -156,22 +156,89 @@ jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initi
 
 **启用 Blue-Green 插件的调试日志:**
 
-**选项 1: 在 JDBC URL 中配置**
+AWS JDBC Wrapper 内部使用 **Java Util Logging (JUL)**。推荐通过 JDBC URL 的 `wrapperLoggerLevel` 参数控制日志级别。
+
+**推荐: 通过 JDBC URL 配置（单一控制点）**
 ```
 jdbc:aws-wrapper:mysql://<cluster-endpoint>:3306/<database>?wrapperPlugins=initialConnection,auroraConnectionTracker,bg,failover2,efm2&wrapperLoggerLevel=FINE
 ```
 
-**选项 2: Java 应用程序代码**
+**工作负载模拟器 CLI 选项:**
+```bash
+java -jar workload-simulator.jar \
+  --aurora-endpoint <cluster-endpoint> \
+  --jdbc-log-level FINE \
+  --password <password>
+```
+
+**JUL 日志级别参考:**
+
+| 级别 | 详细程度 | 使用场景 |
+|------|----------|----------|
+| `SEVERE` | 最低 | 仅错误和严重故障 |
+| `WARNING` | 低 | 警告和错误 |
+| `INFO` | 正常 | 正常操作消息（默认） |
+| `CONFIG` | 中等 | 配置信息 |
+| `FINE` | 高 | 调试级别诊断信息 |
+| `FINER` | 更高 | 更详细的跟踪 |
+| `FINEST` | 最高 | 最大详细程度 - 所有内部操作 |
+| `OFF` | 无 | 禁用所有 JDBC wrapper 日志 |
+| `ALL` | 全部 | 启用所有日志级别 |
+
+**日志架构（工作负载模拟器）:**
+```
+CLI: --jdbc-log-level FINE
+        ↓
+JDBC URL: wrapperLoggerLevel=FINE  ← 单一控制点
+        ↓
+AWS JDBC Wrapper (JUL) 在源头过滤日志
+        ↓
+SLF4JBridgeHandler 转发到 SLF4J
+        ↓
+Log4j2 透传到 Console + RollingFile (level="all")
+```
+
+**为什么使用 URL 控制?**
+- **单一控制点** - 不会混淆哪个过滤器在生效
+- **简单** - 一个参数控制一切
+- **可预测** - 日志级别在 JDBC wrapper 源头设置
+- **标准** - 使用 AWS JDBC Wrapper 的原生参数
+
+**备选方案: Java 应用程序代码**
 ```java
 // Java 应用程序 - 添加到启动代码
 java.util.logging.Logger.getLogger("software.amazon.jdbc.plugin.bluegreen").setLevel(Level.FINE);
 ```
 
-**选项 3: Log4j2 配置**
+**备选方案: Log4j2 配置（透传模式）**
 ```xml
-<Logger name="software.amazon.jdbc.plugin.bluegreen" level="FINE" additivity="false">
+<!-- 设置 level="all" 透传 - 过滤由 wrapperLoggerLevel 完成 -->
+<Logger name="software.amazon.jdbc" level="all" additivity="false">
   <AppenderRef ref="Console"/>
+  <AppenderRef ref="RollingFile"/>
 </Logger>
+```
+
+**JUL 到 SLF4J 桥接（适用于 SLF4J/Log4j2 应用程序）**
+
+AWS JDBC Wrapper 内部使用 **Java Util Logging (JUL)**，但应用程序通常使用 **SLF4J/Log4j2**。桥接器将它们连接起来：
+
+```java
+// 在应用程序 main() 中 - 创建连接之前
+LogManager.getLogManager().reset();
+SLF4JBridgeHandler.removeHandlersForRootLogger();
+SLF4JBridgeHandler.install();
+```
+
+这会将 `software.amazon.jdbc.*` 的所有 JUL 日志重定向到 SLF4J，然后路由到 Log4j2。
+
+**Maven 依赖:**
+```xml
+<dependency>
+  <groupId>org.slf4j</groupId>
+  <artifactId>jul-to-slf4j</artifactId>
+  <version>2.0.16</version>
+</dependency>
 ```
 
 ####  6. 监控设置
