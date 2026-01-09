@@ -43,26 +43,27 @@
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- AWS JDBC Wrapper logger (via JUL bridge) with dynamic level control -->
-        <Logger name="software.amazon.jdbc" level="${sys:jdbc.log.level:-info}" additivity="false">
+        <!--
+            AWS JDBC Wrapper loggers: PASS THROUGH ALL logs
+            Log level filtering is controlled by wrapperLoggerLevel in JDBC URL (via CLI jdbc-log-level option)
+            Log4j2 does NOT filter these logs; it only routes them to Console + RollingFile
+        -->
+        <Logger name="software.amazon.jdbc" level="all" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- Blue-Green plugin specific (most detailed) -->
-        <Logger name="software.amazon.jdbc.plugin.bluegreen" level="${sys:jdbc.bluegreen.log.level:-${sys:jdbc.log.level:-info}}" additivity="false">
+        <Logger name="software.amazon.jdbc.plugin.bluegreen" level="all" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- Failover plugin specific -->
-        <Logger name="software.amazon.jdbc.plugin.failover2" level="${sys:jdbc.failover.log.level:-${sys:jdbc.log.level:-info}}" additivity="false">
+        <Logger name="software.amazon.jdbc.plugin.failover2" level="all" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>
 
-        <!-- Enhanced Failure Monitoring plugin -->
-        <Logger name="software.amazon.jdbc.plugin.efm2" level="${sys:jdbc.efm.log.level:-${sys:jdbc.log.level:-info}}" additivity="false">
+        <Logger name="software.amazon.jdbc.plugin.efm2" level="all" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>

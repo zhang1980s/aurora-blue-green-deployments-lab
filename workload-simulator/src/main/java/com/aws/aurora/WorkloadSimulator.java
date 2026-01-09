@@ -63,6 +63,7 @@ public class WorkloadSimulator {
     private final int logIntervalSeconds;
     private final String blueGreenDeploymentId;
     private final ConsoleFormat consoleFormat;
+    private final String wrapperLoggerLevel;
 
     // Data source and connection pool
     private HikariDataSource dataSource;
@@ -118,6 +119,7 @@ public class WorkloadSimulator {
         this.logIntervalSeconds = config.logIntervalSeconds;
         this.blueGreenDeploymentId = config.blueGreenDeploymentId;
         this.consoleFormat = config.consoleFormat;
+        this.wrapperLoggerLevel = config.wrapperLoggerLevel;
 
         // Initialize metrics registry
         if (config.enablePrometheus) {
@@ -162,6 +164,10 @@ public class WorkloadSimulator {
         jdbcUrl.append("&failoverClusterTopologyRefreshRateMs=2000");
         jdbcUrl.append("&bgConnectTimeoutMs=30000");
         jdbcUrl.append("&bgSwitchoverTimeoutMs=180000");
+
+        // Add wrapperLoggerLevel to control AWS JDBC Wrapper's JUL logging
+        // This is the ONLY filter for JDBC wrapper logs (Log4j2 is set to pass through)
+        jdbcUrl.append("&wrapperLoggerLevel=").append(wrapperLoggerLevel);
 
         hikariConfig.setJdbcUrl(jdbcUrl.toString());
         hikariConfig.setUsername(username);
@@ -934,7 +940,7 @@ public class WorkloadSimulator {
         String blueGreenDeploymentId = null;
         boolean enablePrometheus = false;
         ConsoleFormat consoleFormat = ConsoleFormat.DASHBOARD; // Default to Format 3
-        String jdbcLogLevel = "info"; // Default JDBC wrapper log level
+        String wrapperLoggerLevel = "INFO"; // Default JDBC wrapper log level (JUL level)
     }
 
     /**
@@ -993,14 +999,14 @@ public class WorkloadSimulator {
                     }
                     break;
                 case "--jdbc-log-level":
-                    String logLevel = args[++i].toLowerCase();
-                    if (logLevel.equals("finest") || logLevel.equals("fine") || logLevel.equals("info") ||
-                        logLevel.equals("warn") || logLevel.equals("error") || logLevel.equals("debug") ||
-                        logLevel.equals("trace")) {
-                        config.jdbcLogLevel = logLevel;
+                    String logLevel = args[++i].toUpperCase();
+                    if (logLevel.equals("FINEST") || logLevel.equals("FINER") || logLevel.equals("FINE") ||
+                        logLevel.equals("CONFIG") || logLevel.equals("INFO") || logLevel.equals("WARNING") ||
+                        logLevel.equals("SEVERE") || logLevel.equals("OFF") || logLevel.equals("ALL")) {
+                        config.wrapperLoggerLevel = logLevel;
                     } else {
-                        System.err.println("Error: Invalid JDBC log level: " + logLevel);
-                        System.err.println("Valid levels: finest, fine, debug, info, warn, error, trace");
+                        System.err.println("Error: Invalid JDBC wrapper log level: " + logLevel);
+                        System.err.println("Valid JUL levels: FINEST, FINER, FINE, CONFIG, INFO, WARNING, SEVERE, OFF, ALL");
                         System.exit(1);
                     }
                     break;
@@ -1036,10 +1042,8 @@ public class WorkloadSimulator {
             System.exit(1);
         }
 
-        // Set JDBC log level system property for log4j2.xml
-        System.setProperty("jdbc.log.level", config.jdbcLogLevel);
-
         // Configure JUL to SLF4J bridge for AWS JDBC Wrapper logging
+        // Note: Log level is controlled by wrapperLoggerLevel in JDBC URL, not Log4j2
         // This allows us to see AWS JDBC Wrapper logs through SLF4J/Log4j2
         LogManager.getLogManager().reset();
         SLF4JBridgeHandler.removeHandlersForRootLogger();
@@ -1079,7 +1083,7 @@ public class WorkloadSimulator {
         System.out.println("  --blue-green-deployment-id <id> Blue-Green deployment ID (optional, auto-detect if not provided)");
         System.out.println("  --enable-prometheus             Enable Prometheus metrics export");
         System.out.println("  --console-format <format>       Console output format: verbose, event_driven, dashboard (default: dashboard)");
-        System.out.println("  --jdbc-log-level <level>        JDBC wrapper log level: finest, fine, debug, info, warn, error (default: info)");
+        System.out.println("  --jdbc-log-level <level>        JDBC wrapper log level (JUL): FINEST, FINER, FINE, CONFIG, INFO, WARNING, SEVERE (default: INFO)");
         System.out.println("  --help                          Show this help message");
         System.out.println("\nExamples:");
         System.out.println("  # Basic usage");
@@ -1111,7 +1115,7 @@ public class WorkloadSimulator {
         System.out.println("  java -jar workload-simulator.jar \\");
         System.out.println("    --aurora-endpoint my-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com \\");
         System.out.println("    --blue-green-deployment-id bgd-123456 \\");
-        System.out.println("    --jdbc-log-level finest \\");
+        System.out.println("    --jdbc-log-level FINEST \\");
         System.out.println("    --console-format dashboard \\");
         System.out.println("    --password MySecretPassword");
     }

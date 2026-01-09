@@ -371,6 +371,189 @@ jdbc:aws-wrapper:mysql://endpoint:3306/database?wrapperPlugins=initialConnection
 - `bgConnectTimeoutMs`: Connection timeout during switchover (default: 30000ms)
 - `bgSwitchoverTimeoutMs`: Maximum switchover duration (default: 180000ms)
 
+## Logging Implementation
+
+### Architecture Overview
+
+The workload simulator uses a **simplified URL-only** approach for JDBC wrapper log level control:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  CLI: --jdbc-log-level FINE                                                  │
+│              ↓                                                               │
+│  JDBC URL: wrapperLoggerLevel=FINE  ← SINGLE CONTROL POINT                   │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               ↓
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         AWS JDBC Wrapper (JUL)                               │
+│  [wrapperLoggerLevel=FINE] ← ONLY FILTER (controls what gets emitted)        │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               ↓
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        SLF4JBridgeHandler                                    │
+│  Forwards ALL logs from JUL to SLF4J (no filtering)                          │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               ↓
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Log4j2 (level="all")                                  │
+│  PASS THROUGH - no filtering, only routing to appenders                      │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               ↓
+              ┌────────────────┴────────────────┐
+              ▼                                 ▼
+┌───────────────────────────────┐  ┌───────────────────────────────────────────┐
+│        RollingFile            │  │              Console                      │
+│  logs/workload-simulator-     │  │  SYSTEM_OUT with colored output           │
+│    ${timestamp}.log           │  │                                           │
+│  - 100MB per file max         │  │  Example:                                 │
+│  - Keeps 10 files             │  │  2025-01-05 10:15:23.456 FINE [main]      │
+│  - Gzip compressed            │  │  BlueGreenPlugin - Topology changed       │
+└───────────────────────────────┘  └───────────────────────────────────────────┘
+```
+
+**Key Point:** Log level is controlled ONLY by `wrapperLoggerLevel` in the JDBC URL. Log4j2 passes through everything.
+
+### JUL to SLF4J Bridge
+
+The AWS JDBC Wrapper uses **Java Util Logging (JUL)** internally, but the workload simulator uses **SLF4J/Log4j2**. The bridge connects them:
+
+```java
+// In WorkloadSimulator.main()
+LogManager.getLogManager().reset();
+SLF4JBridgeHandler.removeHandlersForRootLogger();
+SLF4JBridgeHandler.install();
+```
+
+This redirects all JUL logs from `software.amazon.jdbc.*` to SLF4J, which then routes them to Log4j2.
+
+### Log4j2 Configuration
+
+The `log4j2.xml` configuration provides:
+
+**1. Console Appender** - Real-time colored output to stdout:
+```xml
+<Console name="Console" target="SYSTEM_OUT">
+    <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight{%-5level} [%t] %c{1} - %msg%n">
+        <DisableAnsi>false</DisableAnsi>
+    </PatternLayout>
+</Console>
+```
+
+**2. RollingFile Appender** - Persistent logs with rotation:
+```xml
+<RollingFile name="RollingFile"
+             fileName="logs/workload-simulator-${log.timestamp}.log"
+             filePattern="logs/workload-simulator-${log.timestamp}-%d{yyyy-MM-dd}-%i.log.gz">
+    <Policies>
+        <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+        <SizeBasedTriggeringPolicy size="100 MB"/>
+    </Policies>
+    <DefaultRolloverStrategy max="10"/>
+</RollingFile>
+```
+
+### JDBC Wrapper Log Level Control
+
+The JDBC wrapper log level is controlled via the `--jdbc-log-level` CLI argument, which sets the `wrapperLoggerLevel` parameter in the JDBC URL.
+
+**Usage:**
+```bash
+java -jar workload-simulator.jar \
+  --aurora-endpoint my-cluster.xxxxx.us-east-1.rds.amazonaws.com \
+  --jdbc-log-level FINE \
+  --password MySecret
+```
+
+### JUL Log Level Reference
+
+The `--jdbc-log-level` argument accepts standard Java Util Logging (JUL) levels:
+
+| Level | Verbosity | When to Use |
+|-------|-----------|-------------|
+| `SEVERE` | Lowest | Only errors and critical failures |
+| `WARNING` | Low | Warnings and errors |
+| `INFO` | Normal | Normal operational messages (default) |
+| `CONFIG` | Medium | Configuration information |
+| `FINE` | High | Debug-level diagnostic information |
+| `FINER` | Higher | More detailed tracing |
+| `FINEST` | Highest | Maximum verbosity - all internal operations |
+| `OFF` | None | Disable all JDBC wrapper logging |
+| `ALL` | Everything | Enable all log levels |
+
+**Examples:**
+```bash
+# Default (INFO level)
+java -jar workload-simulator.jar --aurora-endpoint ... --password ...
+
+# Debug Blue-Green switchover issues
+java -jar workload-simulator.jar --aurora-endpoint ... --jdbc-log-level FINE --password ...
+
+# Maximum verbosity for troubleshooting
+java -jar workload-simulator.jar --aurora-endpoint ... --jdbc-log-level FINEST --password ...
+
+# Quiet mode (errors only)
+java -jar workload-simulator.jar --aurora-endpoint ... --jdbc-log-level SEVERE --password ...
+```
+
+### Sample Log Output
+
+**Normal Operation (INFO level):**
+```
+2025-01-05 10:15:23.456 INFO  [main] WorkloadSimulator - Connection pool initialized with 100 max connections
+2025-01-05 10:15:24.123 INFO  [Worker-1] WorkloadSimulator - SUCCESS: Worker-1 | Host: ip-10-0-1-45 | Table: test_0001 | INSERT completed | Latency: 12ms
+```
+
+**Blue-Green Switchover (FINE level):**
+```
+2025-01-05 10:15:23.456 FINE  [HikariPool-1] BlueGreenPlugin - Detected topology change
+2025-01-05 10:15:23.457 FINE  [HikariPool-1] BlueGreenPlugin - New writer endpoint: ip-10-0-2-78
+2025-01-05 10:15:23.458 INFO  [Worker-5] WorkloadSimulator - Switched to new host: ip-10-0-2-78 (from: ip-10-0-1-45)
+```
+
+**Troubleshooting with FINEST level:**
+```bash
+# Maximum verbosity for debugging Blue-Green issues
+java -jar workload-simulator.jar \
+     --aurora-endpoint my-cluster.xxxxx.us-east-1.rds.amazonaws.com \
+     --jdbc-log-level FINEST \
+     --console-format verbose \
+     --password MySecret
+```
+
+### Log File Location
+
+Logs are written to the `logs/` directory relative to where the JAR is executed:
+
+```
+logs/
+├── workload-simulator-2025-01-05-101523.log      # Current log file
+├── workload-simulator-2025-01-05-101523-2025-01-05-1.log.gz  # Rolled (compressed)
+└── workload-simulator-2025-01-05-101523-2025-01-05-2.log.gz  # Rolled (compressed)
+```
+
+### How It Works
+
+The workload simulator uses the AWS JDBC Wrapper's native `wrapperLoggerLevel` URL parameter for log level control:
+
+```
+CLI: --jdbc-log-level FINE
+        ↓
+JDBC URL: jdbc:aws-wrapper:mysql://...?wrapperLoggerLevel=FINE&...
+        ↓
+AWS JDBC Wrapper filters logs at source (JUL)
+        ↓
+SLF4JBridgeHandler forwards to SLF4J (no filtering)
+        ↓
+Log4j2 passes through to Console + RollingFile (no filtering)
+```
+
+**Why URL-based control?**
+
+- **Single control point** - No confusion about which filter is active
+- **Simple** - One CLI argument controls everything
+- **Predictable** - Log level set at JDBC wrapper source
+- **Standard** - Uses AWS JDBC Wrapper's native parameter
+
 ## Performance Tuning
 
 ### Connection Pool Sizing

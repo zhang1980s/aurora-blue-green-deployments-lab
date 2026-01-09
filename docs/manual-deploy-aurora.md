@@ -9,7 +9,7 @@ aws rds create-db-instance --engine 'aurora-mysql' --engine-version '8.0.mysql_a
 aws rds create-blue-green-deployment --blue-green-deployment-name 'bg-deployment-268-a' --source 'arn:aws:rds:ap-southeast-1:894855526703:cluster:database-268-a' --target-engine-version '8.0.mysql_aurora.3.10.2' --target-db-parameter-group-name 'default.aurora-mysql8.0' --target-db-cluster-parameter-group-name 'bggroup' --region ap-southeast-1
 
 
-java -DLOG_LEVEL=DEBUG -jar target/workload-simulator.jar  \
+java -jar target/workload-simulator.jar  \
 --aurora-endpoint database-268-a.cluster-cfsctj42orch.ap-southeast-1.rds.amazonaws.com \
 --database-name lab_db  \
 --username admin \
@@ -18,7 +18,8 @@ java -DLOG_LEVEL=DEBUG -jar target/workload-simulator.jar  \
 --write-rate 50 \
 --read-workers 10 \
 --read-rate 50 \
---connection-pool-size 150
+--connection-pool-size 150 \
+--jdbc-log-level FINE
 
 
 
@@ -33,7 +34,7 @@ aws rds create-db-instance --engine 'aurora-mysql' --engine-version '8.0.mysql_a
 aws rds create-blue-green-deployment --blue-green-deployment-name 'bg-deployment-268-b' --source 'arn:aws:rds:ap-southeast-1:894855526703:cluster:database-268-b' --target-engine-version '8.0.mysql_aurora.3.10.2' --target-db-parameter-group-name 'default.aurora-mysql8.0' --target-db-cluster-parameter-group-name 'bggroup' --region ap-southeast-1
 
 
-java -DLOG_LEVEL=DEBUG -jar target/workload-simulator.jar  \
+java -jar target/workload-simulator.jar  \
 --aurora-endpoint database-268-b.cluster-cfsctj42orch.ap-southeast-1.rds.amazonaws.com \
 --database-name lab_db  \
 --username admin \
@@ -42,4 +43,6 @@ java -DLOG_LEVEL=DEBUG -jar target/workload-simulator.jar  \
 --write-rate 50 \
 --read-workers 10 \
 --read-rate 50 \
---connection-pool-size 150
+--connection-pool-size 150 \
+--jdbc-log-level fine \
+--console-format dashboard 
